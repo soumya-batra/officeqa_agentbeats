@@ -37,7 +37,7 @@ async def send_message(
     streaming: bool = False,
     timeout: int = DEFAULT_TIMEOUT,
 ):
-    timeout_config = httpx.Timeout(timeout=None, read=None, write=None, connect=60.0, pool=None)
+    timeout_config = httpx.Timeout(timeout=timeout, connect=min(timeout, 60.0))
     async with httpx.AsyncClient(timeout=timeout_config) as httpx_client:
         resolver = A2ACardResolver(httpx_client=httpx_client, base_url=base_url)
         agent_card = await resolver.get_agent_card()

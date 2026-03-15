@@ -55,10 +55,14 @@ jobs:
 
       - name: Run assessment
         run: |
-          docker compose up --abort-on-container-exit --exit-code-from judge
+          docker compose up --abort-on-container-exit --exit-code-from agentbeats-client
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'openai' }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-5.2' }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-opus-4-5-20251101' }}
+          ENABLE_WEB_SEARCH: ${{ vars.ENABLE_WEB_SEARCH || 'false' }}
 
       - name: Record provenance
         run: python record_provenance.py

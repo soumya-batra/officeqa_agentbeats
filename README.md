@@ -97,6 +97,10 @@ docker compose up --abort-on-container-exit --exit-code-from agentbeats-client
 | `ANTHROPIC_API_KEY` | Anthropic API key | - |
 | `ANTHROPIC_MODEL` | Anthropic model name | `claude-opus-4-5-20251101` |
 | `ENABLE_WEB_SEARCH` | Enable web search for document retrieval | `false` |
+| `REASONING_EFFORT` | Optional reasoning level for GPT-5 models | empty |
+| `CORPUS_DIR` | Local path to parsed Treasury Bulletin `.txt` files | empty |
+| `CPI_DATA_PATH` | Local path to CPI reference CSV for inflation questions | empty |
+| `RETRIEVAL_TOP_K` | Number of local corpus files to pass into the solver | `3` |
 
 ### Baseline Configurations
 
@@ -262,13 +266,27 @@ cp sample.env .env
 uv sync --extra judge --extra participant --extra dev
 ```
 
-3. Run green agent scoring tests: `uv run pytest judge/tests/ -v`
+3. Run green agent scoring tests: `uv run --extra dev pytest judge/tests/ participant/tests/ -v`
+
+No `.env` file or API key is required for the unit tests above.
 
 4. Start each agent in separate terminals:
 ```bash
 uv run python judge/src/server.py --host 127.0.0.1 --port 9009
 
 uv run python participant/src/server.py --host 127.0.0.1 --port 9019
+```
+
+For end-to-end runs that call the participant LLM, create a local `.env` first. Minimum OpenAI example:
+```bash
+cat > .env << 'EOF'
+LLM_PROVIDER=openai
+OPENAI_API_KEY=<your-openai-api-key>
+OPENAI_MODEL=gpt-5.2
+ENABLE_WEB_SEARCH=false
+CORPUS_DIR=/absolute/path/to/treasury_bulletins_parsed
+CPI_DATA_PATH=/absolute/path/to/cpi.csv
+EOF
 ```
 
 ### Building Images Locally
