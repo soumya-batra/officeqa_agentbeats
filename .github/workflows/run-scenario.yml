@@ -53,7 +53,18 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
+      - name: Check for LLM API key
+        id: check-key
+        run: |
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ] && [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "::warning::No LLM API key configured. Skipping assessment."
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Run assessment
+        if: steps.check-key.outputs.skip != 'true'
         run: |
           docker compose up --abort-on-container-exit --exit-code-from agentbeats-client
         env:
@@ -65,9 +76,11 @@ jobs:
           ENABLE_WEB_SEARCH: ${{ vars.ENABLE_WEB_SEARCH || 'false' }}
 
       - name: Record provenance
+        if: steps.check-key.outputs.skip != 'true'
         run: python record_provenance.py
 
       - name: Generate submission ID
+        if: steps.check-key.outputs.skip != 'true'
         id: submission
         run: |
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -75,6 +88,7 @@ jobs:
           echo "id=${SUBMITTER}_${TIMESTAMP}" >> $GITHUB_OUTPUT
 
       - name: Copy results to submissions
+        if: steps.check-key.outputs.skip != 'true'
         run: |
           mkdir -p submissions/${{ steps.submission.outputs.id }}
           cp scenario.toml submissions/${{ steps.submission.outputs.id }}/
@@ -82,6 +96,7 @@ jobs:
           cp provenance.json submissions/${{ steps.submission.outputs.id }}/ || true
 
       - name: Create results branch and commit
+        if: steps.check-key.outputs.skip != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -92,6 +107,7 @@ jobs:
           git push origin $BRANCH
 
       - name: Output PR link
+        if: steps.check-key.outputs.skip != 'true'
         run: |
           echo "::notice::Create PR at: ${{ github.server_url }}/${{ github.repository }}/compare/main...$BRANCH"
 
