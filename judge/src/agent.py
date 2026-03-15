@@ -29,6 +29,15 @@ logger = logging.getLogger(__name__)
 
 
 DATASET_URL = "https://raw.githubusercontent.com/databricks/officeqa/main/officeqa.csv"
+QUESTION_TIMEOUT_SECONDS = 600
+
+
+def _format_source_field(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item) for item in value)
+    return str(value)
 
 
 class EvalRequest(BaseModel):
@@ -104,10 +113,12 @@ def detect_unit_in_context(context: str) -> tuple[str | None, float]:
     return (None, 1.0)
 
 
-def normalize_number_with_units(number: float, context: str) -> tuple[float, str | None]:
+def normalize_number_with_units(number: float, context: str, has_percent: bool = False) -> tuple[float, str | None, bool]:
     try:
-        unit_name, _ = detect_unit_in_context(context)
-        return (number, unit_name)
+        if has_percent:
+            return (number / 100.0, "percent", True)
+        unit_name, multiplier = detect_unit_in_context(context)
+        return (number * multiplier, unit_name, False)
     except Exception as e:
         raise ValueError(f"Failed to normalize number {number} with context '{context}': {e}") from e
 
@@ -230,24 +241,29 @@ def fuzzy_match_answer(ground_truth: str, predicted: str, tolerance: float = 0.0
     except Exception as e:
         raise ValueError(f"Failed to extract numbers: {e}") from e
 
-    gt_numbers = [(num, ctx) for num, ctx, _, _ in gt_numbers_with_context]
-    pred_numbers = [(num, ctx) for num, ctx, _, _ in pred_numbers_with_context]
+    gt_numbers = [(num, ctx, has_percent) for num, ctx, has_percent, _ in gt_numbers_with_context]
+    pred_numbers = [(num, ctx, has_percent) for num, ctx, has_percent, _ in pred_numbers_with_context]
 
     if gt_numbers and pred_numbers:
         if len(gt_numbers) > 1:
-            pred_non_years = [(n, c) for n, c in pred_numbers
-                             if not is_likely_year(n) or any(is_likely_year(g) for g, _ in gt_numbers)]
+            pred_non_years = [
+                (n, c, p)
+                for n, c, p in pred_numbers
+                if not is_likely_year(n) or any(is_likely_year(g) for g, _, _ in gt_numbers)
+            ]
             matched_gt = []
             unmatched_gt = []
-            for gt_val, gt_context in gt_numbers:
+            for gt_val, gt_context, gt_has_percent in gt_numbers:
                 try:
-                    gt_base, gt_unit = normalize_number_with_units(gt_val, gt_context)
+                    gt_base, gt_unit, _ = normalize_number_with_units(gt_val, gt_context, gt_has_percent)
                 except Exception as e:
                     raise ValueError(f"Failed to normalize GT number {gt_val}: {e}") from e
                 found_match = False
-                for pred_val, pred_context in pred_non_years:
+                for pred_val, pred_context, pred_has_percent in pred_non_years:
+                    if gt_has_percent != pred_has_percent:
+                        continue
                     try:
-                        pred_base, pred_unit = normalize_number_with_units(pred_val, pred_context)
+                        pred_base, pred_unit, _ = normalize_number_with_units(pred_val, pred_context, pred_has_percent)
                     except Exception as e:
                         raise ValueError(f"Failed to normalize prediction number {pred_val}: {e}") from e
                     if gt_base == 0:
@@ -272,9 +288,9 @@ def fuzzy_match_answer(ground_truth: str, predicted: str, tolerance: float = 0.0
             else:
                 return False, f"List mismatch: Found {len(matched_gt)}/{len(gt_numbers)} numbers. Missing: {unmatched_gt}"
         else:
-            gt_val, gt_context = gt_numbers[0]
+            gt_val, gt_context, gt_has_percent = gt_numbers[0]
             try:
-                gt_base, gt_unit = normalize_number_with_units(gt_val, gt_context)
+                gt_base, gt_unit, _ = normalize_number_with_units(gt_val, gt_context, gt_has_percent)
             except Exception as e:
                 raise ValueError(f"Failed to normalize GT number: {e}") from e
             gt_has_text, _ = has_significant_text(ground_truth)
@@ -282,11 +298,13 @@ def fuzzy_match_answer(ground_truth: str, predicted: str, tolerance: float = 0.0
             best_match = None
             best_diff = float('inf')
             best_pred_info = None
-            for pred_val, pred_context in pred_numbers:
+            for pred_val, pred_context, pred_has_percent in pred_numbers:
                 if should_filter_years and is_likely_year(pred_val):
                     continue
+                if gt_has_percent != pred_has_percent:
+                    continue
                 try:
-                    pred_base, pred_unit = normalize_number_with_units(pred_val, pred_context)
+                    pred_base, pred_unit, _ = normalize_number_with_units(pred_val, pred_context, pred_has_percent)
                 except Exception as e:
                     raise ValueError(f"Failed to normalize prediction number: {e}") from e
                 if gt_base == 0:
@@ -308,7 +326,7 @@ def fuzzy_match_answer(ground_truth: str, predicted: str, tolerance: float = 0.0
             if best_match is not None:
                 return False, f"No match: GT={gt_base} ({gt_unit or 'no unit'}), Closest={best_pred_info[0]} ({best_pred_info[1] or 'no unit'}), Diff={best_diff*100:.2f}%"
             else:
-                return False, f"No valid numbers found in prediction (filtered out years: {[n for n, _ in pred_numbers[:5]]})"
+                return False, f"No valid numbers found in prediction (filtered out years: {[n for n, _, _ in pred_numbers[:5]]})"
 
     gt_clean = ground_truth.strip().lower().strip('"').strip("'")
     pred_clean = predicted.strip().lower().strip('"').strip("'")
@@ -419,15 +437,22 @@ class OfficeQAAgent:
         q: dict,
         agent_url: str,
         tolerance: float,
+        question_timeout: int,
     ) -> QuestionResult:
         prompt = self._build_prompt(q)
         try:
-            response = await self.messenger.talk_to_agent(
-                message=prompt,
-                url=agent_url,
-                new_conversation=True,
-                timeout=600,
+            response = await asyncio.wait_for(
+                self.messenger.talk_to_agent(
+                    message=prompt,
+                    url=agent_url,
+                    new_conversation=True,
+                    timeout=question_timeout,
+                ),
+                timeout=question_timeout,
             )
+        except asyncio.TimeoutError:
+            logger.error("Timed out waiting for response for %s after %ss", q["uid"], question_timeout)
+            response = f"Error: timed out after {question_timeout}s"
         except Exception as e:
             logger.error(f"Failed to get response for {q['uid']}: {e}")
             response = f"Error: {e}"
@@ -460,6 +485,7 @@ class OfficeQAAgent:
         task_id: str,
         context_id: str,
         max_concurrent: int = 10,
+        question_timeout: int = QUESTION_TIMEOUT_SECONDS,
     ) -> EvaluationResults:
         await self._emit_status(
             event_queue, task_id, context_id, TaskState.working,
@@ -475,7 +501,7 @@ class OfficeQAAgent:
         async def bounded_evaluate(q: dict) -> QuestionResult:
             nonlocal completed
             async with semaphore:
-                result = await self._evaluate_single_question(q, agent_url, tolerance)
+                result = await self._evaluate_single_question(q, agent_url, tolerance, question_timeout)
                 async with lock:
                     completed += 1
                     results_list.append(result)
@@ -505,7 +531,17 @@ class OfficeQAAgent:
         )
 
     def _build_prompt(self, question: dict) -> str:
-        return question['question']
+        prompt_lines = [
+            f"Question UID: {question['uid']}",
+            question["question"],
+            "",
+            "Use the OfficeQA corpus if available. Return the answer in <REASONING> and <FINAL_ANSWER> tags.",
+        ]
+        if question.get("source_docs"):
+            prompt_lines.append(f"Relevant source documents: {_format_source_field(question['source_docs'])}")
+        if question.get("source_files"):
+            prompt_lines.append(f"Relevant source files: {_format_source_field(question['source_files'])}")
+        return "\n".join(prompt_lines).strip()
 
     async def run(
         self,
@@ -529,6 +565,8 @@ class OfficeQAAgent:
 
         config = request.config
         tolerance = config.get("tolerance", 0.0)
+        max_concurrent = int(config.get("max_concurrent", 10))
+        question_timeout = int(config.get("question_timeout_seconds", QUESTION_TIMEOUT_SECONDS))
 
         await self._emit_status(
             event_queue, task_id, context_id, TaskState.working,
@@ -552,6 +590,8 @@ class OfficeQAAgent:
             event_queue=event_queue,
             task_id=task_id,
             context_id=context_id,
+            max_concurrent=max_concurrent,
+            question_timeout=question_timeout,
         )
 
         summary = f"""OfficeQA Evaluation Complete

@@ -9,3 +9,4 @@ build/
 .mypy_cache/
 .pytest_cache/
 uv.lock
+output/solver_debug/
