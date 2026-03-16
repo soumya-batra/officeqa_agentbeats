@@ -7,11 +7,12 @@ env = { LOG_LEVEL = "INFO" }
 agentbeats_id = ""
 name = "officeqa_agent"
 image = "ghcr.io/arnavsinghvi11/officeqa-agent:latest"
-env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
+env = { LLM_PROVIDER = "${LLM_PROVIDER}", OPENAI_API_KEY = "${OPENAI_API_KEY}", OPENAI_MODEL = "${OPENAI_MODEL}", ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}", ANTHROPIC_MODEL = "${ANTHROPIC_MODEL}", ENABLE_WEB_SEARCH = "${ENABLE_WEB_SEARCH}", CORPUS_DIR = "${CORPUS_DIR}", CPI_DATA_PATH = "${CPI_DATA_PATH}", RETRIEVAL_TOP_K = "${RETRIEVAL_TOP_K}" }
 
 [config]
-dataset_url = "https://raw.githubusercontent.com/databricks/officeqa/main/officeqa.csv"
+dataset_url = "https://raw.githubusercontent.com/databricks/officeqa/main/officeqa_full.csv"
 corpus_url = "https://github.com/databricks/officeqa/tree/main/treasury_bulletins_parsed"
 num_questions = 246
 difficulty = "all"
 tolerance = 0.0
+max_concurrent = 2

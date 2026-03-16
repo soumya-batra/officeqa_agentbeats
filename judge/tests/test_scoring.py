@@ -250,9 +250,17 @@ class TestFuzzyMatchAnswer:
         matches, rationale = fuzzy_match_answer("2.6 billion", "2.6 billion")
         assert matches is True
 
+    def test_cross_unit_aware_matching(self):
+        matches, rationale = fuzzy_match_answer("2.6 billion", "2600 million")
+        assert matches is True
+
     def test_percentage_match(self):
         matches, rationale = fuzzy_match_answer("15.3%", "15.3%")
         assert matches is True
+
+    def test_percentage_does_not_match_plain_number(self):
+        matches, rationale = fuzzy_match_answer("15.3%", "15.3")
+        assert matches is False
 
     def test_hedged_answer_rejected(self):
         matches, rationale = fuzzy_match_answer("100", "Either 100 or 200 or 300")
@@ -334,3 +342,7 @@ class TestEdgeCases:
         pred = "<FINAL_ANSWER>100</FINAL_ANSWER>"
         is_correct, _ = score_answer(gt, pred)
         assert is_correct is True
+
+    def test_thousand_matches_expanded_number(self):
+        matches, rationale = fuzzy_match_answer("5 thousand", "5000")
+        assert matches is True
