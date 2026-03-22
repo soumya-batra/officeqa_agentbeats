@@ -52,7 +52,7 @@ services:
       CORPUS_DIR: ${CORPUS_DIR}
       CPI_DATA_PATH: ${CPI_DATA_PATH}
       RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K}
-      PARSED_JSON_DIR: /Users/zaidishahbaz/Desktop/side/agentsbeat/officeqa/treasury_bulletins_parsed/jsons
+      PARSED_JSON_DIR: /Users/soumyabatra/Documents/officeqa_agentbeats/treasury_bulletins_transformed
       DEBUG_OUTPUT_DIR: /app/output/solver_debug/run_20260316T114933Z
       WRITE_DEBUG_ARTIFACTS: 'true'
       LLM_CACHE_PATH: /app/output/llm_cache.json
