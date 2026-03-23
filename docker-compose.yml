@@ -30,17 +30,19 @@ services:
     networks:
     - agentnet
   officeqa_agent:
-    image: ghcr.io/arnavsinghvi11/officeqa-agent:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.officeqa-agent
     container_name: officeqa-agent
     command:
     - --host
     - 0.0.0.0
     - --port
-    - '9009'
+    - '9019'
     - --card-url
-    - http://officeqa_agent:9009
+    - http://officeqa_agent:9019
     ports:
-    - 9019:9009
+    - 9019:9019
     environment:
       PYTHONUNBUFFERED: '1'
       LLM_PROVIDER: ${LLM_PROVIDER}
@@ -49,11 +51,10 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL}
       ENABLE_WEB_SEARCH: ${ENABLE_WEB_SEARCH}
-      CORPUS_DIR: ${CORPUS_DIR}
+      CORPUS_DIR: /app/corpus
+      FAISS_INDEX_DIR: /app/faiss_index
       CPI_DATA_PATH: ${CPI_DATA_PATH}
-      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K}
-      PARSED_JSON_DIR: /Users/soumyabatra/Documents/officeqa_agentbeats/treasury_bulletins_transformed
-      DEBUG_OUTPUT_DIR: /app/output/solver_debug/run_20260316T114933Z
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-8}
       WRITE_DEBUG_ARTIFACTS: 'true'
       LLM_CACHE_PATH: /app/output/llm_cache.json
     healthcheck:
@@ -61,7 +62,7 @@ services:
       - CMD
       - curl
       - -f
-      - http://localhost:9009/.well-known/agent-card.json
+      - http://localhost:9019/.well-known/agent-card.json
       interval: 5s
       timeout: 3s
       retries: 10
@@ -70,8 +71,8 @@ services:
     - agentnet
     volumes:
     - ./output:/app/output
-    - /Users/zaidishahbaz/Desktop/side/agentsbeat/officeqa/treasury_bulletins_parsed/transformed:/Users/zaidishahbaz/Desktop/side/agentsbeat/officeqa/treasury_bulletins_parsed/transformed:ro
-    - /Users/zaidishahbaz/Desktop/side/agentsbeat/officeqa/treasury_bulletins_parsed/jsons:/Users/zaidishahbaz/Desktop/side/agentsbeat/officeqa/treasury_bulletins_parsed/jsons:ro
+    - ./treasury_bulletins_transformed:/app/corpus:ro
+    - ./faiss_index:/app/faiss_index
   agentbeats-client:
     image: ghcr.io/agentbeats/agentbeats-client:v1.0.0
     container_name: agentbeats-client

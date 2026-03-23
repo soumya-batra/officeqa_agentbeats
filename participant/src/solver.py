@@ -1,25 +1,56 @@
+import json
 import logging
 import re
 
-from calculator import calculate_from_series
 from config import SolverConfig
 from debug_artifacts import build_context_snapshot, timestamp_utc, write_debug_artifact
 from external_data import CPIData
 from formatting import canonicalize_final_answer, ensure_structured_response
 from json_source import load_page_contexts
 from llm import LLMClient
-from models import QuestionAnalysis, SolverResult
-from retrieval import Retriever
+from models import SolverResult
+from faiss_retriever import FaissRetriever
 from source_hints import parse_source_hints
-from table_parser import find_calendar_year_total, find_relevant_row
 
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a grounded OfficeQA solving agent.
+PREPROCESS_SYSTEM_PROMPT = """You are a search query optimizer for US Treasury Bulletin documents.
 
-Use retrieved Treasury Bulletin context when provided. Prefer exact figures from the documents over guesswork.
-If calculation is required, explain the arithmetic clearly and preserve full precision until the final step.
+Given a user question, output a short retrieval query optimized for document search:
+- 10-20 words
+- Resolves implicit time references (e.g., "1 year before World War 2" -> 1938)
+- Converts fiscal year notation (FY1934 -> fiscal year 1934)
+- Preserves table names, row labels, column names, specific years, dollar amounts, and named entities
+- Strips procedural filler ("what was", "find the", "calculate")
+
+Output in JSON format:
+{
+  "retrieval_query": "<your optimized query>"
+}"""
+
+SYSTEM_PROMPT = """You are answering questions from Treasury documents using retrieved context.
+
+Rules:
+- Always answer using the provided context.
+- If the question involves numerical reasoning, aggregation, comparison, or multi-step calculations, use the python tool.
+- Do not perform arithmetic mentally when precise computation is required.
+- For simple lookups, answer directly without using tools.
+- When using the python tool, show the final computed answer clearly.
+
+## Source priority
+1. Always retrieve figures directly from the Treasury Bulletin documents using file search.
+2. Use web search only for external data explicitly required by the question (e.g. CPI indices, exchange rates).
+3. Never rely on memorized values — always verify against the source documents.
+
+## Calendar year vs fiscal year
+- Fiscal year: July 1 through June 30 (e.g. fiscal year 1940 = July 1939 – June 1940).
+- Calendar year: January 1 through December 31 of that year.
+
+## Precision
+- Preserve full numerical precision throughout; only round at the final step as instructed.
+- Pay close attention to the exact table name, row label, and column in the question — do not substitute a similar-sounding category.
+
 
 Return your response in the following required format:
 <REASONING>
@@ -30,88 +61,45 @@ Return your response in the following required format:
 </FINAL_ANSWER>
 """
 
-MATH_KEYWORDS = {
-    "calculate",
-    "change",
-    "difference",
-    "average",
-    "mean",
-    "correlation",
-    "regression",
-    "variance",
-    "standard deviation",
-    "percent",
-    "ratio",
-    "forecast",
-}
-EXTERNAL_DATA_KEYWORDS = {"inflation", "cpi", "exchange rate", "exchange rates"}
-MONTH_NAME_PATTERN = re.compile(
-    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
-    r"sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
-    re.IGNORECASE,
-)
-SAFE_MONTHLY_TOTAL_TOKENS = {
-    "individual calendar months",
-    "monthly values",
-    "calendar months",
-    "reported values for all individual calendar months",
-}
-COMPLEX_DETERMINISTIC_TOKENS = {
-    "average",
-    "mean",
-    "geometric mean",
-    "weighted average",
-    "difference",
-    "change",
-    "ratio",
-    "regression",
-    "ordinary least squares",
-    "ols",
-    "correlation",
-    "variance",
-    "standard deviation",
-    "coefficient of variation",
-    "cagr",
-    "compound annual growth rate",
-    "predict",
-    "project",
-    "forecast",
-    "highest",
-    "lowest",
-    "maximum",
-    "minimum",
-    "page number",
-    "issue date",
-    "list",
-    "square brackets",
-    "comma-separated",
-    "euclidean norm",
-    "fisher",
-    "box-cox",
-    "duration",
-    "denomination",
-    "absolute percentage points",
-    "contribution",
-    "slope",
-    "intercept",
-    "which",
-    "on which",
-}
-
-
 class OfficeQASolver:
     def __init__(self, config: SolverConfig | None = None, llm_client: LLMClient | None = None):
         self._config = config or SolverConfig.from_env()
         self._llm_client = llm_client or LLMClient(self._config)
-        self._retriever = Retriever(self._config.corpus_dir, self._config.retrieval_top_k)
+        self._retriever = FaissRetriever(self._config.corpus_dir, self._config.faiss_index_dir, self._config.retrieval_top_k)
         self._cpi_data = CPIData(self._config.cpi_data_path)
+
+    def _preprocess_question(self, core_question: str) -> tuple[str, str]:
+        """Call a cheap LLM to get an optimized retrieval query.
+
+        Returns (retrieval_query, _). Falls back to core_question on error.
+        """
+        try:
+            raw = self._llm_client.complete_cheap(
+                system_prompt=PREPROCESS_SYSTEM_PROMPT,
+                prompt=core_question,
+            )
+            parsed = json.loads(raw)
+            retrieval_query = parsed.get("retrieval_query") or core_question
+            print(f"[PREPROCESS] retrieval_query: {retrieval_query}")
+            return retrieval_query, retrieval_query
+        except Exception as exc:
+            logger.warning("Preprocess failed, using raw question: %s", exc)
+            return core_question, core_question
 
     def solve_question(self, question: str) -> SolverResult:
         question_uid = self._extract_question_uid(question)
         source_hints = parse_source_hints(question)
         core_question = self._extract_core_question(question)
-        analysis = self._analyze_question(core_question)
-        contexts = self._collect_contexts(core_question, source_hints) if analysis.needs_retrieval else []
+        retrieval_query, _ = self._preprocess_question(core_question)
+        contexts = self._collect_contexts(retrieval_query, source_hints)
+        print("\n" + "="*80)
+        print(f"RETRIEVED CHUNKS ({len(contexts)} total):")
+        print("-"*80)
+        for i, ctx in enumerate(contexts, start=1):
+            print(f"[Chunk {i}] source={ctx.source}  score={ctx.score:.2f}")
+            print(ctx.content)
+            print("-"*40)
+        print("="*80 + "\n")
         logger.info(
             "Solving question with source_files=%s source_pages=%s contexts=%s",
             source_hints.source_files,
@@ -123,41 +111,18 @@ class OfficeQASolver:
             "question_uid": question_uid,
             "question_prompt": question,
             "core_question": core_question,
+            "retrieval_query": retrieval_query,
             "source_hints": source_hints,
-            "analysis": analysis,
             "contexts": build_context_snapshot(contexts),
         }
         try:
-            deterministic = self._solve_deterministically(core_question, analysis, contexts)
-            if deterministic is not None:
-                logger.info("Answered deterministically with %s", deterministic.final_answer)
-                deterministic = SolverResult(
-                    final_answer=canonicalize_final_answer(question, deterministic.final_answer),
-                    reasoning=deterministic.reasoning,
-                    analysis=deterministic.analysis,
-                    retrieved_contexts=deterministic.retrieved_contexts,
-                    raw_response=deterministic.raw_response,
-                )
-                self._write_debug_artifact(
-                    question_uid or self._fallback_artifact_id(core_question),
-                    {
-                        **base_debug_payload,
-                        "route": "deterministic",
-                        "final_answer": deterministic.final_answer,
-                        "reasoning": deterministic.reasoning,
-                    },
-                )
-                return deterministic
-
-            prompt = self._build_prompt(core_question, analysis, contexts)
-            logger.info("Falling back to model for question")
+            prompt = self._build_prompt(core_question, contexts)
             raw_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=prompt)
             reasoning, final_answer = ensure_structured_response(raw_response)
             final_answer = canonicalize_final_answer(question, final_answer)
             result = SolverResult(
                 final_answer=final_answer,
                 reasoning=reasoning,
-                analysis=analysis,
                 retrieved_contexts=contexts,
                 raw_response=raw_response,
             )
@@ -215,20 +180,21 @@ class OfficeQASolver:
         normalized = re.sub(r"[^a-z0-9]+", "_", core_question.lower()).strip("_")
         return normalized[:80] or "question"
 
-    def _collect_contexts(self, question: str, source_hints) -> list:
+    def _collect_contexts(self, retrieval_query: str, source_hints) -> list:
+        query_vec = self._retriever._embed_query(retrieval_query)
         contexts = []
         if source_hints.source_files:
-            contexts.extend(self._retriever.retrieve_by_source_files(source_hints.source_files, question))
+            contexts.extend(self._retriever.retrieve_by_source_files(source_hints.source_files, retrieval_query, query_vec))  # type: ignore[arg-type]
             contexts.extend(
                 load_page_contexts(
                     self._config.parsed_json_dir,
                     source_hints.source_files,
                     source_hints.source_pages,
-                    question,
+                    retrieval_query,
                     top_k=8,
                 )
             )
-        contexts.extend(self._retriever.retrieve(question))
+        contexts.extend(self._retriever.retrieve(retrieval_query, query_vec))
         limit = max(self._config.retrieval_top_k + 7, 10) if source_hints.source_files else self._config.retrieval_top_k + 3
         deduped = {}
         for context in contexts:
@@ -238,143 +204,9 @@ class OfficeQASolver:
                 deduped[key] = context
         return sorted(deduped.values(), key=lambda context: context.score, reverse=True)[:limit]
 
-    def _solve_deterministically(self, question: str, analysis: QuestionAnalysis, contexts) -> SolverResult | None:
-        year_total = find_calendar_year_total(question, contexts)
-        if year_total is not None:
-            final_answer = self._format_numeric_answer(question, year_total[0])
-            return SolverResult(
-                final_answer=final_answer,
-                reasoning=year_total[1],
-                analysis=analysis,
-                retrieved_contexts=contexts,
-                raw_response="",
-            )
-
-        if not self._question_allows_safe_row_deterministic(question):
-            return None
-
-        row = find_relevant_row(question, contexts)
-        if row is None:
-            return None
-
-        if self._question_is_safe_monthly_total(question):
-            calculation = calculate_from_series(question, row.values_by_year)
-            if calculation is None:
-                return None
-            final_answer = calculation.formatted_answer or self._format_numeric_answer(question, calculation.value)
-            return SolverResult(
-                final_answer=final_answer,
-                reasoning=f"{calculation.explanation}. Source row: {row.label}",
-                analysis=analysis,
-                retrieved_contexts=contexts,
-                raw_response="",
-            )
-
-        if self._question_is_safe_annual_lookup(question, row.values_by_year):
-            year = re.findall(r"\b(?:19|20)\d{2}\b", question)[0]
-            final_answer = self._format_numeric_answer(question, row.values_by_year[year])
-            return SolverResult(
-                final_answer=final_answer,
-                reasoning=f"Selected the value for {year} directly from the parsed table row. Source row: {row.label}",
-                analysis=analysis,
-                retrieved_contexts=contexts,
-                raw_response="",
-            )
-
-        adjusted = self._maybe_adjust_for_inflation(question, row.values_by_year)
-        if adjusted is not None:
-            final_answer = self._format_numeric_answer(question, adjusted[0])
-            return SolverResult(
-                final_answer=final_answer,
-                reasoning=adjusted[1],
-                analysis=analysis,
-                retrieved_contexts=contexts,
-                raw_response="",
-            )
-        return None
-
-    def _question_allows_safe_row_deterministic(self, question: str) -> bool:
-        lowered = question.lower()
-        if any(token in lowered for token in COMPLEX_DETERMINISTIC_TOKENS):
-            return False
-        return self._question_is_safe_monthly_total(question) or self._question_has_single_annual_target(question)
-
-    def _question_is_safe_monthly_total(self, question: str) -> bool:
-        lowered = question.lower()
-        if "difference" in lowered or "change" in lowered:
-            return False
-        if len(re.findall(r"\b(?:19|20)\d{2}\b", question)) != 1:
-            return False
-        return any(token in lowered for token in SAFE_MONTHLY_TOTAL_TOKENS)
-
-    def _question_has_single_annual_target(self, question: str) -> bool:
-        years = re.findall(r"\b(?:19|20)\d{2}\b", question)
-        if len(years) != 1:
-            return False
-        if MONTH_NAME_PATTERN.search(question):
-            return False
-        return True
-
-    def _question_is_safe_annual_lookup(self, question: str, series: dict[str, float]) -> bool:
-        years = re.findall(r"\b(?:19|20)\d{2}\b", question)
-        return len(years) == 1 and years[0] in series and self._question_has_single_annual_target(question)
-
-    def _analyze_question(self, question: str) -> QuestionAnalysis:
-        lowered = question.lower()
-        needs_calculation = any(keyword in lowered for keyword in MATH_KEYWORDS)
-        needs_external_data = any(keyword in lowered for keyword in EXTERNAL_DATA_KEYWORDS)
-        has_year = bool(re.search(r"\b(?:19|20)\d{2}\b", question))
-        category = "calculation" if needs_calculation else "lookup"
-        if needs_external_data:
-            category = "external-data"
-        return QuestionAnalysis(
-            category=category,
-            needs_retrieval=True if has_year or "treasury" in lowered else True,
-            needs_calculation=needs_calculation,
-            needs_external_data=needs_external_data,
-        )
-
-    def _maybe_adjust_for_inflation(self, question: str, series: dict[str, float]) -> tuple[float, str] | None:
-        lowered = question.lower()
-        if "inflation" not in lowered and "cpi" not in lowered:
-            return None
-        years = re.findall(r"\b(?:19|20)\d{2}\b", question)
-        if len(years) < 2:
-            return None
-        from_year, to_year = years[0], years[-1]
-        amount = series.get(from_year)
-        if amount is None:
-            return None
-        adjusted = self._cpi_data.adjust(amount, from_year=from_year, to_year=to_year)
-        if adjusted is None:
-            return None
-        explanation = f"Adjusted {amount} from {from_year} dollars to {to_year} dollars using CPI data"
-        return adjusted, explanation
-
-    def _format_numeric_answer(self, question: str, value: float) -> str:
-        lowered = question.lower()
-        wants_percent_sign = any(
-            token in lowered
-            for token in (
-                "percent value",
-                "as a percentage",
-                "reported as a percent value",
-                "expressed as a percent",
-                "%",
-            )
-        ) and "decimal value" not in lowered and "no percentage sign" not in lowered
-        if wants_percent_sign:
-            return f"{value:.2f}%"
-        if value.is_integer():
-            return str(int(value))
-        return f"{value:.2f}"
-
-    def _build_prompt(self, question: str, analysis: QuestionAnalysis, contexts) -> str:
+    def _build_prompt(self, question: str, contexts) -> str:
         lines = [
             "Solve the following OfficeQA question using the best available evidence.",
-            f"Question category: {analysis.category}",
-            f"Requires calculation: {'yes' if analysis.needs_calculation else 'no'}",
-            f"Requires external data: {'yes' if analysis.needs_external_data else 'no'}",
             "",
             "FINAL_ANSWER rules:",
             "- If the answer is a single scalar, output only that scalar.",

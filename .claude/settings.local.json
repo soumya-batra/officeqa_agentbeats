@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -i \"national defense\\\\|2602\\\\|2,602\\\\|1657\\\\|1,657\" /Users/soumyabatra/Documents/officeqa_agentbeats/treasury_bulletins_transformed/treasury_bulletin_1940_*.txt)",
+      "Bash(grep -i \"national defense\" /Users/soumyabatra/Documents/officeqa_agentbeats/treasury_bulletins_transformed/treasury_bulletin_1941_*.txt)",
+      "Bash(python3:*)",
+      "Bash(echo {})",
+      "Bash(docker compose:*)",
+      "Bash(tee /tmp/run_output.txt)"
+    ]
+  }
+}

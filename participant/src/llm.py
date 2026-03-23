@@ -1,6 +1,7 @@
 import os
 import hashlib
 import json
+import time
 from pathlib import Path
 
 from config import SolverConfig
@@ -65,7 +66,7 @@ class LLMClient:
                 "system_prompt": system_prompt,
                 "prompt": prompt,
                 "reasoning_effort": self._config.reasoning_effort,
-                "web_search": self._config.enable_web_search,
+                "enable_web_search": self._config.enable_web_search,
             },
             sort_keys=True,
         )
@@ -94,17 +95,45 @@ class LLMClient:
     def _complete_openai(self, *, system_prompt: str, prompt: str) -> str:
         client = OpenAI()
         model = self._config.openai_model
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                return self._complete_openai_once(client=client, model=model, system_prompt=system_prompt, prompt=prompt)
+            except Exception as e:
+                if "429" in str(e) or "rate_limit" in str(e).lower() or "insufficient_quota" in str(e).lower():
+                    wait = 2 ** attempt * 10  # 10s, 20s, 40s, 80s, 160s
+                    import logging
+                    logging.getLogger(__name__).warning(f"Rate limit hit, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                else:
+                    raise
+        return self._complete_openai_once(client=client, model=model, system_prompt=system_prompt, prompt=prompt)
+
+    def _complete_openai_once(self, *, client, model: str, system_prompt: str, prompt: str) -> str:
         if model.startswith("gpt-5"):
+            tools = []
+            if self._config.enable_web_search:
+                tools.append({"type": "web_search"})
+            tools.append({"type": "code_interpreter", "container": {"type": "auto"}})
             kwargs = {
                 "model": model,
                 "instructions": system_prompt,
                 "input": [{"role": "user", "content": prompt}],
-                "tools": [{"type": "web_search"}] if self._config.enable_web_search else None,
+                "tools": tools or None,
             }
             if self._config.reasoning_effort:
                 kwargs["reasoning"] = {"effort": self._config.reasoning_effort}
             else:
                 kwargs["temperature"] = 0
+            print("\n" + "="*80)
+            print("SYSTEM PROMPT (instructions):")
+            print("-"*80)
+            print(system_prompt)
+            print("="*80)
+            print("USER PROMPT (input):")
+            print("-"*80)
+            print(prompt)
+            print("="*80 + "\n")
             response = client.responses.create(**kwargs)
             return response.output_text or ""
 
@@ -117,6 +146,29 @@ class LLMClient:
             temperature=0,
         )
         return response.choices[0].message.content or ""
+
+    def complete_cheap(self, *, system_prompt: str, prompt: str) -> str:
+        """Call a cheap/fast model (gpt-4o-mini) with JSON response format.
+
+        Used for pre-processing steps like query rewriting. Not cached.
+        Falls back to the main provider if OpenAI is unavailable.
+        """
+        import os
+        if OPENAI_AVAILABLE and os.environ.get("OPENAI_API_KEY"):
+            client = OpenAI()
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                max_tokens=256,
+                response_format={"type": "json_object"},
+            )
+            return response.choices[0].message.content or ""
+        # fallback: use main provider without JSON enforcement
+        return self.complete(system_prompt=system_prompt, prompt=prompt)
 
     def _complete_anthropic(self, *, system_prompt: str, prompt: str) -> str:
         client = anthropic.Anthropic()

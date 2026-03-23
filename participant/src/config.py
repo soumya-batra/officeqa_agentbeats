@@ -24,6 +24,7 @@ class SolverConfig:
     reasoning_effort: str
     enable_web_search: bool
     corpus_dir: Path | None
+    faiss_index_dir: Path | None
     parsed_json_dir: Path | None
     cpi_data_path: Path | None
     retrieval_top_k: int
@@ -47,6 +48,7 @@ class SolverConfig:
             reasoning_effort=os.environ.get("REASONING_EFFORT", ""),
             enable_web_search=_env_bool("ENABLE_WEB_SEARCH"),
             corpus_dir=corpus_dir,
+            faiss_index_dir=_env_path("FAISS_INDEX_DIR"),
             parsed_json_dir=parsed_json_dir,
             cpi_data_path=_env_path("CPI_DATA_PATH"),
             retrieval_top_k=int(os.environ.get("RETRIEVAL_TOP_K", "3")),
