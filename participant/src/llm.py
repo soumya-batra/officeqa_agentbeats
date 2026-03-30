@@ -20,6 +20,14 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
+try:
+    from google import genai
+    from google.genai import types as genai_types
+
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
 
 class LLMClient:
     def __init__(self, config: SolverConfig):
@@ -34,17 +42,26 @@ class LLMClient:
         if cached is not None:
             return cached
 
+        use_gemini = (
+            GEMINI_AVAILABLE
+            and os.environ.get("GOOGLE_API_KEY")
+            and (provider == "gemini" or (provider == "" and os.environ.get("GOOGLE_API_KEY") and not os.environ.get("OPENAI_API_KEY")))
+        )
         use_openai = (
             OPENAI_AVAILABLE
             and os.environ.get("OPENAI_API_KEY")
-            and (provider == "openai" or (provider == "" and not os.environ.get("ANTHROPIC_API_KEY")))
+            and (provider == "openai" or (provider == "" and not os.environ.get("ANTHROPIC_API_KEY") and not use_gemini))
         )
         use_anthropic = (
             ANTHROPIC_AVAILABLE
             and os.environ.get("ANTHROPIC_API_KEY")
-            and (provider == "anthropic" or (provider == "" and not use_openai))
+            and (provider == "anthropic" or (provider == "" and not use_openai and not use_gemini))
         )
 
+        if use_gemini:
+            response = self._complete_gemini(system_prompt=system_prompt, prompt=prompt)
+            self._store_cache(cache_key, response)
+            return response
         if use_openai:
             response = self._complete_openai(system_prompt=system_prompt, prompt=prompt)
             self._store_cache(cache_key, response)
@@ -63,6 +80,7 @@ class LLMClient:
                 "provider": provider,
                 "openai_model": self._config.openai_model,
                 "anthropic_model": self._config.anthropic_model,
+                "gemini_model": self._config.gemini_model,
                 "system_prompt": system_prompt,
                 "prompt": prompt,
                 "reasoning_effort": self._config.reasoning_effort,
@@ -100,11 +118,19 @@ class LLMClient:
             try:
                 return self._complete_openai_once(client=client, model=model, system_prompt=system_prompt, prompt=prompt)
             except Exception as e:
-                if "429" in str(e) or "rate_limit" in str(e).lower() or "insufficient_quota" in str(e).lower():
+                err_str = str(e).lower()
+                if "429" in str(e) or "rate_limit" in err_str or "insufficient_quota" in err_str:
                     wait = 2 ** attempt * 10  # 10s, 20s, 40s, 80s, 160s
                     import logging
                     logging.getLogger(__name__).warning(f"Rate limit hit, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
                     time.sleep(wait)
+                elif "invalid_prompt" in err_str or "usage policy" in err_str:
+                    # Content policy filter triggered — truncate context and retry
+                    import logging
+                    logging.getLogger(__name__).warning(f"Content policy filter hit, truncating prompt (attempt {attempt+1})")
+                    # Reduce prompt size by removing the last ~30% of context
+                    lines = prompt.split("\n")
+                    prompt = "\n".join(lines[:int(len(lines) * 0.7)])
                 else:
                     raise
         return self._complete_openai_once(client=client, model=model, system_prompt=system_prompt, prompt=prompt)
@@ -148,12 +174,49 @@ class LLMClient:
         return response.choices[0].message.content or ""
 
     def complete_cheap(self, *, system_prompt: str, prompt: str) -> str:
-        """Call a cheap/fast model (gpt-4o-mini) with JSON response format.
+        """Call a cheap/fast model with JSON response format.
 
         Used for pre-processing steps like query rewriting. Not cached.
-        Falls back to the main provider if OpenAI is unavailable.
+        Falls back to the main provider if unavailable.
         """
         import os
+        provider = self._config.llm_provider
+        # Gemini path — use gemini-3-flash for fast reformulation tasks
+        if (provider == "gemini" or (not os.environ.get("OPENAI_API_KEY"))) and GEMINI_AVAILABLE and os.environ.get("GOOGLE_API_KEY"):
+            client = genai.Client()
+            model = "gemini-3-flash-preview"
+            config = genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0,
+                max_output_tokens=1024,
+                response_mime_type="application/json",
+            )
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=config,
+                    )
+                    parts = []
+                    for candidate in response.candidates or []:
+                        for part in candidate.content.parts or []:
+                            if hasattr(part, "text") and part.text:
+                                parts.append(part.text)
+                    return "\n".join(parts) if parts else (response.text or "")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "429" in str(e) or "rate" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
+                        wait = 2 ** attempt * 10
+                        import logging
+                        logging.getLogger(__name__).warning(f"Gemini rate limit in complete_cheap, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+                        time.sleep(wait)
+                    else:
+                        raise
+            # Final attempt
+            response = client.models.generate_content(model=model, contents=prompt, config=config)
+            return response.text or ""
         if OPENAI_AVAILABLE and os.environ.get("OPENAI_API_KEY"):
             client = OpenAI()
             response = client.chat.completions.create(
@@ -170,17 +233,81 @@ class LLMClient:
         # fallback: use main provider without JSON enforcement
         return self.complete(system_prompt=system_prompt, prompt=prompt)
 
+    def _complete_gemini(self, *, system_prompt: str, prompt: str) -> str:
+        client = genai.Client()
+        model = self._config.gemini_model
+        tools = []
+        if self._config.enable_web_search:
+            tools.append(genai_types.Tool(google_search=genai_types.GoogleSearch()))
+        tools.append(genai_types.Tool(code_execution=genai_types.ToolCodeExecution()))
+
+        config = genai_types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            tools=tools,
+            temperature=0,
+        )
+        if self._config.reasoning_effort:
+            config.thinking_config = genai_types.ThinkingConfig(
+                thinking_budget={"low": 1024, "medium": 8192, "high": 16384}.get(
+                    self._config.reasoning_effort, 8192
+                )
+            )
+
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+                # Extract text parts (skip thinking parts)
+                parts = []
+                for candidate in response.candidates or []:
+                    for part in candidate.content.parts or []:
+                        if hasattr(part, "text") and part.text:
+                            parts.append(part.text)
+                return "\n".join(parts) if parts else (response.text or "")
+            except Exception as e:
+                err_str = str(e).lower()
+                retryable = (
+                    "429" in str(e) or "rate" in err_str or "quota" in err_str
+                    or "resource_exhausted" in err_str or "disconnected" in err_str
+                    or "remoteprotocolerror" in err_str or "connection" in err_str
+                    or "500" in str(e) or "503" in str(e) or "unavailable" in err_str
+                    or "internal" in err_str or "too long" in err_str
+                    or "exceeds the maximum" in err_str
+                )
+                if retryable:
+                    wait = min(2 ** attempt * 5, 30)
+                    import logging
+                    logging.getLogger(__name__).warning(f"Gemini error, retrying in {wait}s (attempt {attempt+1}/{max_retries}): {e}")
+                    time.sleep(wait)
+                else:
+                    raise
+        # Final attempt without retry
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config,
+        )
+        return response.text or ""
+
     def _complete_anthropic(self, *, system_prompt: str, prompt: str) -> str:
         client = anthropic.Anthropic()
+        tools = []
+        if self._config.enable_web_search:
+            tools.append({"type": "web_search_20250305", "name": "web_search", "max_uses": 10})
+        # Always enable code execution for calculation-heavy questions
+        tools.append({"type": "code_execution_20250522", "name": "code_execution"})
         kwargs = {
             "model": self._config.anthropic_model,
             "max_tokens": self._config.anthropic_max_tokens,
             "system": system_prompt,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
+            "tools": tools,
         }
-        if self._config.enable_web_search:
-            kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}]
         response = client.messages.create(**kwargs)
         text_parts = [block.text for block in response.content if hasattr(block, "text")]
         return "\n".join(text_parts) if text_parts else ""

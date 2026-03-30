@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -12,13 +13,24 @@ from models import RetrievedContext
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = "text-embedding-3-small"
+OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
 MAX_BATCH_TOKENS = 250_000
 RRF_K = 60            # standard RRF constant
 GLOBAL_CANDIDATE_K = 50   # how many each of FAISS global and BM25 global contribute
 ERA_CANDIDATE_K = 200     # how many year-era FAISS contributes (already filtered to era)
-RRF_TOP_N = 30            # keep this many after RRF, feed to cross-encoder
-CROSS_ENCODER_MODEL = "BAAI/bge-reranker-v2-m3"
+
+
+def _detect_embedding_provider() -> str:
+    """Determine which embedding provider to use based on env vars."""
+    provider = os.environ.get("LLM_PROVIDER", "").lower()
+    if provider == "gemini" and os.environ.get("GOOGLE_API_KEY"):
+        return "gemini"
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+    if os.environ.get("GOOGLE_API_KEY"):
+        return "gemini"
+    return "openai"  # fallback
 
 
 class FaissRetriever:
@@ -28,21 +40,50 @@ class FaissRetriever:
         self._chunks: list[dict] = []
         self._bm25   = None
         self._bm25_corpus: list[list[str]] = []
-        self._cross_encoder = None
-        self._cross_encoder_loaded = False
         # Offline indices built after chunks are loaded
         self._chunk_bulletin_year: list[int | None] = []   # bulletin year per chunk
         self._year_content_index: dict[int, list[int]] = {}  # year -> chunk indices containing that year
 
-        index_path    = index_dir / "index.faiss"
-        meta_path     = index_dir / "chunks.json"
-        bm25_path     = index_dir / "bm25.pkl"
-        year_idx_path = index_dir / "year_index.json"
+        self._embedding_provider = _detect_embedding_provider()
+        logger.info("Embedding provider: %s", self._embedding_provider)
+
+        # Use provider-specific subdirectory for index files
+        provider_dir = index_dir / self._embedding_provider
+        provider_dir.mkdir(parents=True, exist_ok=True)
+
+        index_path    = provider_dir / "index.faiss"
+        meta_path     = provider_dir / "chunks.json"
+        bm25_path     = provider_dir / "bm25.pkl"
+        year_idx_path = provider_dir / "year_index.json"
+
+        # Check for existing chunks from ANY provider or root dir (for BM25 reuse)
+        any_meta = None
+        # Check root index dir first
+        if (index_dir / "chunks.json").exists():
+            any_meta = index_dir / "chunks.json"
+        else:
+            for alt in index_dir.iterdir():
+                if alt.is_dir() and (alt / "chunks.json").exists():
+                    any_meta = alt / "chunks.json"
+                    break
 
         if index_path.exists() and meta_path.exists():
             self._load(index_path, meta_path)
+        elif any_meta and not meta_path.exists():
+            # Reuse chunks from another provider's index for BM25, skip FAISS build
+            logger.info("No FAISS index for %s, loading chunks from %s for BM25-only retrieval",
+                        self._embedding_provider, any_meta)
+            with any_meta.open("r", encoding="utf-8") as f:
+                self._chunks = json.load(f)
+            logger.info("Loaded %d chunks (BM25-only mode, no FAISS semantic search)", len(self._chunks))
         else:
-            self._build(corpus_dir, index_dir, index_path, meta_path)
+            self._build(corpus_dir, provider_dir, index_path, meta_path)
+
+        # Reuse BM25/year_index from root dir if not in provider dir
+        if not bm25_path.exists() and (index_dir / "bm25.pkl").exists():
+            bm25_path = index_dir / "bm25.pkl"
+        if not year_idx_path.exists() and (index_dir / "year_index.json").exists():
+            year_idx_path = index_dir / "year_index.json"
 
         self._build_bm25(bm25_path)
         self._build_year_index(year_idx_path)
@@ -76,11 +117,14 @@ class FaissRetriever:
 
     def _load(self, index_path: Path, meta_path: Path) -> None:
         import faiss
+
         logger.info("Loading FAISS index from %s", index_path)
         self._index = faiss.read_index(str(index_path))
+
         with meta_path.open("r", encoding="utf-8") as f:
             self._chunks = json.load(f)
-        logger.info("Loaded FAISS index with %d chunks", len(self._chunks))
+        logger.info("Loaded FAISS index with %d chunks (dim=%d, provider=%s)",
+                     len(self._chunks), self._index.d, self._embedding_provider)
 
     # ── build ─────────────────────────────────────────────────────────────────
 
@@ -92,9 +136,8 @@ class FaissRetriever:
         meta_path: Path,
     ) -> None:
         import faiss
-        from openai import OpenAI
 
-        logger.info("Building FAISS index from corpus at %s", corpus_dir)
+        logger.info("Building FAISS index from corpus at %s (provider=%s)", corpus_dir, self._embedding_provider)
         documents = load_corpus(corpus_dir)
 
         all_chunks: list[dict] = []
@@ -108,16 +151,15 @@ class FaissRetriever:
                     "section":       chunk.get("section", ""),
                 })
 
-        logger.info("Chunked corpus into %d chunks, embedding...", len(all_chunks))
+        logger.info("Chunked corpus into %d chunks, embedding with %s...", len(all_chunks), self._embedding_provider)
 
-        client     = OpenAI()
         embeddings: list[list[float]] = []
-        batches    = self._build_batches(all_chunks)
+        batches = self._build_batches(all_chunks)
 
         logger.info("Split into %d token-safe batches", len(batches))
 
         for i, batch in enumerate(batches):
-            self._embed_batch_with_retry(client, batch, embeddings)
+            self._embed_batch_with_retry(batch, embeddings)
             logger.info("Embedded batch %d / %d  (%d chunks so far)",
                         i + 1, len(batches),
                         sum(len(b) for b in batches[:i+1]))
@@ -135,7 +177,7 @@ class FaissRetriever:
 
         self._index  = index
         self._chunks = all_chunks
-        logger.info("Built and saved FAISS index with %d chunks", len(all_chunks))
+        logger.info("Built and saved FAISS index with %d chunks (dim=%d)", len(all_chunks), dim)
 
     # ── batch builder ─────────────────────────────────────────────────────────
 
@@ -172,20 +214,19 @@ class FaissRetriever:
 
     def _embed_batch_with_retry(
         self,
-        client,
         batch: list[str],
         embeddings: list,
     ) -> None:
         for attempt in range(10):
             try:
-                resp = client.embeddings.create(
-                    model=EMBEDDING_MODEL,
-                    input=batch,
-                )
-                embeddings.extend([e.embedding for e in resp.data])
+                if self._embedding_provider == "gemini":
+                    self._embed_batch_gemini(batch, embeddings)
+                else:
+                    self._embed_batch_openai(batch, embeddings)
                 return
             except Exception as e:
-                if "429" in str(e) or "rate_limit" in str(e).lower():
+                err_str = str(e).lower()
+                if "429" in str(e) or "rate_limit" in err_str or "rate" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
                     wait = 2 ** attempt * 5
                     logger.warning(
                         "Rate limit hit, retrying in %ds (attempt %d)",
@@ -196,16 +237,38 @@ class FaissRetriever:
                     raise
         raise RuntimeError("Embedding failed after 10 attempts")
 
+    def _embed_batch_openai(self, batch: list[str], embeddings: list) -> None:
+        from openai import OpenAI
+        client = OpenAI()
+        resp = client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=batch)
+        embeddings.extend([e.embedding for e in resp.data])
+
+    def _embed_batch_gemini(self, batch: list[str], embeddings: list) -> None:
+        from google import genai
+        client = genai.Client()
+        # Gemini: max 100 items per batch request, minimal delay to smooth rate
+        SUB_BATCH = 100
+        for i in range(0, len(batch), SUB_BATCH):
+            sub = batch[i:i+SUB_BATCH]
+            resp = client.models.embed_content(model=GEMINI_EMBEDDING_MODEL, contents=sub)
+            embeddings.extend([e.values for e in resp.embeddings])
+            if i + SUB_BATCH < len(batch):
+                time.sleep(0.3)
+
     def _embed_query(self, question: str) -> np.ndarray:
         import faiss
-        from openai import OpenAI
 
-        client = OpenAI()
-        resp   = client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=[question],
-        )
-        vec = np.array([resp.data[0].embedding], dtype=np.float32)
+        if self._embedding_provider == "gemini":
+            from google import genai
+            client = genai.Client()
+            resp = client.models.embed_content(model=GEMINI_EMBEDDING_MODEL, contents=question)
+            vec = np.array([resp.embeddings[0].values], dtype=np.float32)
+        else:
+            from openai import OpenAI
+            client = OpenAI()
+            resp = client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=[question])
+            vec = np.array([resp.data[0].embedding], dtype=np.float32)
+
         faiss.normalize_L2(vec)
         return vec
 
@@ -264,33 +327,6 @@ class FaissRetriever:
             result.update(i for i in self._year_content_index.get(year, []) if i in era_set)
         return list(result)
 
-    # ── cross-encoder rerank ──────────────────────────────────────────────────
-
-    def _load_cross_encoder(self) -> None:
-        if self._cross_encoder_loaded:
-            return
-        self._cross_encoder_loaded = True
-        try:
-            from sentence_transformers import CrossEncoder
-            self._cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
-            logger.info("Loaded cross-encoder: %s", CROSS_ENCODER_MODEL)
-        except Exception as exc:
-            logger.warning("Cross-encoder unavailable (%s); skipping rerank", exc)
-
-    def _rerank(self, question: str, candidates: list[RetrievedContext]) -> list[RetrievedContext]:
-        """Score (question, chunk) pairs with the cross-encoder and return top_k."""
-        self._load_cross_encoder()
-        if self._cross_encoder is None or len(candidates) <= self._top_k:
-            return candidates[:self._top_k]
-        pairs = [(question, c.content[:8000]) for c in candidates]
-        scores = self._cross_encoder.predict(pairs)
-        ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-        logger.info(
-            "Cross-encoder reranked %d → %d  (top score=%.3f)",
-            len(candidates), self._top_k, ranked[0][0] if ranked else 0,
-        )
-        return [c for _, c in ranked[:self._top_k]]
-
     # ── retrieve ──────────────────────────────────────────────────────────────
 
     def _rrf_fuse(
@@ -315,27 +351,26 @@ class FaissRetriever:
         question: str,
         query_vec: "np.ndarray | None" = None,
     ) -> list[RetrievedContext]:
-        if self._index is None or not self._chunks:
+        if not self._chunks:
             return []
         names = {Path(f).name for f in source_files}
         candidate_indices = [i for i, c in enumerate(self._chunks) if Path(c["source"]).name in names]
         if not candidate_indices:
             return []
 
-        candidate_k = min(len(candidate_indices), max(GLOBAL_CANDIDATE_K, ERA_CANDIDATE_K))
+        # FAISS ranks within candidate set (skip if no FAISS index)
+        faiss_ranks: dict[int, int] = {}
+        if self._index is not None:
+            if query_vec is None:
+                query_vec = self._embed_query(question)
+            candidate_matrix = np.array(
+                [self._index.reconstruct(i) for i in candidate_indices], dtype=np.float32
+            )
+            faiss_scores = (candidate_matrix @ query_vec.T).flatten()
+            faiss_order = np.argsort(faiss_scores)[::-1][:GLOBAL_CANDIDATE_K]
+            faiss_ranks = {candidate_indices[int(i)]: rank for rank, i in enumerate(faiss_order)}
 
-        if query_vec is None:
-            query_vec = self._embed_query(question)
-
-        # FAISS ranks within candidate set
-        candidate_matrix = np.array(
-            [self._index.reconstruct(i) for i in candidate_indices], dtype=np.float32
-        )
-        faiss_scores = (candidate_matrix @ query_vec.T).flatten()
-        faiss_order = np.argsort(faiss_scores)[::-1][:GLOBAL_CANDIDATE_K]
-        faiss_ranks = {candidate_indices[int(i)]: rank for rank, i in enumerate(faiss_order)}
-
-        # BM25 ranks within candidate set (scoped — BM25 weighted higher)
+        # BM25 ranks within candidate set
         bm25_ranks: dict[int, int] = {}
         if self._bm25 is not None:
             tokens = self._tokenize(question)
@@ -347,28 +382,35 @@ class FaissRetriever:
             )
             bm25_ranks = {i: rank for rank, (i, _) in enumerate(candidate_bm25[:GLOBAL_CANDIDATE_K])}
 
-        top_rrf = self._rrf_fuse(faiss_ranks, bm25_ranks, faiss_w=0.4, bm25_w=0.6)[:RRF_TOP_N]
-        candidates = [self._make_result(self._chunks[idx], score) for idx, score in top_rrf]
-        return self._rerank(question, candidates)
+        if faiss_ranks:
+            top_rrf = self._rrf_fuse(faiss_ranks, bm25_ranks, faiss_w=0.4, bm25_w=0.6)[:self._top_k]
+        else:
+            # BM25-only mode
+            top_rrf = sorted(bm25_ranks.items(), key=lambda x: x[1])[:self._top_k]
+            top_rrf = [(idx, 1.0 / (RRF_K + rank + 1)) for idx, rank in top_rrf]
+        return [self._make_result(self._chunks[idx], score) for idx, score in top_rrf]
 
     def retrieve(
         self,
         question: str,
         query_vec: "np.ndarray | None" = None,
     ) -> list[RetrievedContext]:
-        if self._index is None or not self._chunks:
+        if not self._chunks:
             return []
 
-        if query_vec is None:
-            query_vec = self._embed_query(question)
+        has_faiss = self._index is not None
 
         # FAISS global (semantic) — top GLOBAL_CANDIDATE_K
-        _, faiss_indices = self._index.search(query_vec, GLOBAL_CANDIDATE_K)
-        faiss_ranks: dict[int, int] = {
-            int(idx): rank
-            for rank, idx in enumerate(faiss_indices[0])
-            if idx >= 0
-        }
+        faiss_ranks: dict[int, int] = {}
+        if has_faiss:
+            if query_vec is None:
+                query_vec = self._embed_query(question)
+            _, faiss_indices = self._index.search(query_vec, GLOBAL_CANDIDATE_K)
+            faiss_ranks = {
+                int(idx): rank
+                for rank, idx in enumerate(faiss_indices[0])
+                if idx >= 0
+            }
 
         # BM25 global (keyword) — top GLOBAL_CANDIDATE_K
         bm25_ranks: dict[int, int] = {}
@@ -378,14 +420,12 @@ class FaissRetriever:
             top_bm25 = np.argsort(bm25_scores)[::-1][:GLOBAL_CANDIDATE_K]
             bm25_ranks = {int(idx): rank for rank, idx in enumerate(top_bm25)}
 
-        # Year-era (wide) and year-near (tight) FAISS passes.
-        # Wide window [year-1, year+8]: captures later bulletins with historical tables.
-        # Tight window [year, year+5]: prioritises contemporary bulletins with original data.
+        # Year-era FAISS passes (only when FAISS available)
         detected_years = self._extract_years(question)
         year_era_ranks: dict[int, int] = {}
         year_near_ranks: dict[int, int] = {}
 
-        if detected_years:
+        if detected_years and has_faiss:
             era_indices  = self._year_era_indices(detected_years, before=1, after=8)
             near_indices = self._year_era_indices(detected_years, before=0, after=5)
             logger.info(
@@ -409,38 +449,52 @@ class FaissRetriever:
                 "Year-era ranks: wide=%d near=%d",
                 len(year_era_ranks), len(year_near_ranks),
             )
+        elif detected_years and self._bm25 is not None:
+            # BM25-only year boost: prioritize chunks from matching year eras
+            era_set = set(self._year_era_indices(detected_years, before=1, after=8))
+            content_set = set()
+            for yr in detected_years:
+                content_set.update(self._year_content_index.get(yr, []))
+            # Boost BM25 scores for year-matching chunks
+            for idx in list(bm25_ranks.keys()):
+                if idx in content_set and idx in era_set:
+                    bm25_ranks[idx] = max(0, bm25_ranks[idx] - 10)  # boost rank
 
-        # Four-way RRF: global FAISS + global BM25 + wide-era + near-era → top RRF_TOP_N
-        all_idx = set(faiss_ranks) | set(bm25_ranks) | set(year_era_ranks) | set(year_near_ranks)
-        rrf_scores: dict[int, float] = {}
-        has_era  = bool(year_era_ranks)
-        has_near = bool(year_near_ranks)
-        fallback_rank = max(GLOBAL_CANDIDATE_K, ERA_CANDIDATE_K)
-        for idx in all_idx:
-            score = 0.0
-            if has_era and has_near:
-                score = (
-                    0.25 / (RRF_K + faiss_ranks.get(idx, fallback_rank) + 1)
-                    + 0.10 / (RRF_K + bm25_ranks.get(idx, fallback_rank) + 1)
-                    + 0.25 / (RRF_K + year_era_ranks.get(idx, fallback_rank) + 1)
-                    + 0.40 / (RRF_K + year_near_ranks.get(idx, fallback_rank) + 1)
-                )
-            elif has_era:
-                score = (
-                    0.40 / (RRF_K + faiss_ranks.get(idx, fallback_rank) + 1)
-                    + 0.20 / (RRF_K + bm25_ranks.get(idx, fallback_rank) + 1)
-                    + 0.40 / (RRF_K + year_era_ranks.get(idx, fallback_rank) + 1)
-                )
-            else:
-                score = (
-                    0.60 / (RRF_K + faiss_ranks.get(idx, fallback_rank) + 1)
-                    + 0.40 / (RRF_K + bm25_ranks.get(idx, fallback_rank) + 1)
-                )
-            rrf_scores[idx] = score
+        # RRF fusion
+        if has_faiss:
+            all_idx = set(faiss_ranks) | set(bm25_ranks) | set(year_era_ranks) | set(year_near_ranks)
+            rrf_scores: dict[int, float] = {}
+            has_era  = bool(year_era_ranks)
+            has_near = bool(year_near_ranks)
+            fallback_rank = max(GLOBAL_CANDIDATE_K, ERA_CANDIDATE_K)
+            for idx in all_idx:
+                score = 0.0
+                if has_era and has_near:
+                    score = (
+                        0.25 / (RRF_K + faiss_ranks.get(idx, fallback_rank) + 1)
+                        + 0.10 / (RRF_K + bm25_ranks.get(idx, fallback_rank) + 1)
+                        + 0.25 / (RRF_K + year_era_ranks.get(idx, fallback_rank) + 1)
+                        + 0.40 / (RRF_K + year_near_ranks.get(idx, fallback_rank) + 1)
+                    )
+                elif has_era:
+                    score = (
+                        0.40 / (RRF_K + faiss_ranks.get(idx, fallback_rank) + 1)
+                        + 0.20 / (RRF_K + bm25_ranks.get(idx, fallback_rank) + 1)
+                        + 0.40 / (RRF_K + year_era_ranks.get(idx, fallback_rank) + 1)
+                    )
+                else:
+                    score = (
+                        0.60 / (RRF_K + faiss_ranks.get(idx, fallback_rank) + 1)
+                        + 0.40 / (RRF_K + bm25_ranks.get(idx, fallback_rank) + 1)
+                    )
+                rrf_scores[idx] = score
+            top_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:self._top_k]
+        else:
+            # BM25-only mode
+            top_rrf = sorted(bm25_ranks.items(), key=lambda x: x[1])[:self._top_k]
+            top_rrf = [(idx, 1.0 / (RRF_K + rank + 1)) for idx, rank in top_rrf]
 
-        top_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:RRF_TOP_N]
-        candidates = [self._make_result(self._chunks[idx], score) for idx, score in top_rrf]
-        return self._rerank(question, candidates)
+        return [self._make_result(self._chunks[idx], score) for idx, score in top_rrf]
 
     def _make_result(self, chunk: dict, score: float) -> RetrievedContext:
         content = chunk["content"]

@@ -10,4 +10,7 @@ build/
 .pytest_cache/
 uv.lock
 output/solver_debug/
+output/answer_cache.json
+output/results_*.json
 treasury_bulletins_transformed/
+faiss_index/

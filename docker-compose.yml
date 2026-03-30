@@ -50,6 +50,8 @@ services:
       OPENAI_MODEL: ${OPENAI_MODEL}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL}
       ENABLE_WEB_SEARCH: ${ENABLE_WEB_SEARCH}
       CORPUS_DIR: /app/corpus
       FAISS_INDEX_DIR: /app/faiss_index
@@ -63,10 +65,10 @@ services:
       - curl
       - -f
       - http://localhost:9019/.well-known/agent-card.json
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 30s
+      interval: 30s
+      timeout: 5s
+      retries: 500
+      start_period: 7200s
     networks:
     - agentnet
     volumes:

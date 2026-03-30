@@ -6,6 +6,25 @@ from models import SolverResult
 NUMBER_TOKEN_PATTERN = re.compile(r"-?\$?\d[\d,]*\.?\d*%?")
 ORDINAL_WORDS = ("first", "second", "third", "fourth", "fifth")
 
+# Patterns for detecting expected answer units from the question text.
+# Order matters: more specific patterns first.
+_UNIT_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"(?:in|report\b.*?\bin)\s+trillions?\s+of\b", re.I), "trillion"),
+    (re.compile(r"(?:in|report\b.*?\bin)\s+billions?\s+of\b", re.I), "billion"),
+    (re.compile(r"(?:in|report\b.*?\bin)\s+millions?\s+of\b", re.I), "million"),
+    (re.compile(r"(?:in|report\b.*?\bin)\s+thousands?\s+of\b", re.I), "thousand"),
+    (re.compile(r"report\b.*?\bmillions?\s+of\s+dollars", re.I), "million"),
+    (re.compile(r"report\b.*?\bbillions?\s+of\s+dollars", re.I), "billion"),
+]
+
+
+def _extract_expected_unit(question: str) -> str | None:
+    """Return the unit keyword the question says the answer should be in, or None."""
+    for pattern, unit in _UNIT_PATTERNS:
+        if pattern.search(question):
+            return unit
+    return None
+
 
 def extract_tag(text: str, tag: str) -> str:
     match = re.search(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, re.DOTALL | re.IGNORECASE)
@@ -184,6 +203,11 @@ def _select_scalar_candidate(question: str, final_answer: str) -> str:
     return final_answer
 
 
+def _maybe_append_unit(answer: str, question: str) -> str:
+    """Benchmark expects bare numbers without unit suffixes — return as-is."""
+    return answer
+
+
 def canonicalize_final_answer(question: str, final_answer: str) -> str:
     cleaned = _strip_markdown(final_answer)
     if not cleaned:
@@ -217,19 +241,23 @@ def canonicalize_final_answer(question: str, final_answer: str) -> str:
     if not tokens and candidate != cleaned:
         tokens = _extract_numeric_tokens(cleaned)
     if not tokens:
-        return cleaned
+        return _maybe_append_unit(cleaned, question)
 
     if len(tokens) == 1:
-        return _normalize_numeric_token(tokens[0], keep_percent=keep_percent)
+        result = _normalize_numeric_token(tokens[0], keep_percent=keep_percent)
+        return _maybe_append_unit(result, question)
 
     lowered_candidate = candidate.lower()
     if "about" in lowered_candidate or "(" in lowered_candidate:
-        return _normalize_numeric_token(tokens[0], keep_percent=keep_percent)
+        result = _normalize_numeric_token(tokens[0], keep_percent=keep_percent)
+        return _maybe_append_unit(result, question)
 
     if any(token in question.lower() for token in ("norm", "forecast error", "z-score", "volatility", "range")):
-        return _normalize_numeric_token(tokens[-1], keep_percent=keep_percent)
+        result = _normalize_numeric_token(tokens[-1], keep_percent=keep_percent)
+        return _maybe_append_unit(result, question)
 
-    return _normalize_numeric_token(tokens[0], keep_percent=keep_percent)
+    result = _normalize_numeric_token(tokens[0], keep_percent=keep_percent)
+    return _maybe_append_unit(result, question)
 
 
 def ensure_structured_response(raw_response: str) -> tuple[str, str]:

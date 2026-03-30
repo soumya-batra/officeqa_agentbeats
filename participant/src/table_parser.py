@@ -584,3 +584,89 @@ def _looks_like_country_label(label: str) -> bool:
 def _looks_like_institution_label(label: str) -> bool:
     lowered = label.lower()
     return any(term in lowered for term in {"department", "administration", "agency", "bureau", "service", "judiciary"})
+
+
+def reformat_tables_in_context(text: str) -> str:
+    """Reformat pipe-delimited tables into explicit row-value format.
+
+    Transforms:
+        | Category | 1939 | 1940 | 1941 |
+        |----------|------|------|------|
+        | National defense | 1,075 | 1,657 | 6,301 |
+
+    Into:
+        TABLE:
+        [headers: Category | 1939 | 1940 | 1941]
+        National defense → 1939: 1,075 | 1940: 1,657 | 1941: 6,301
+    """
+    lines = text.split("\n")
+    result_lines: list[str] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+        # Detect start of pipe table
+        if line.startswith("|") and line.endswith("|") and line.count("|") >= 3:
+            # Collect all pipe-table lines
+            table_lines: list[str] = []
+            while i < len(lines):
+                stripped = lines[i].strip()
+                if stripped.startswith("|") and stripped.endswith("|"):
+                    table_lines.append(stripped)
+                    i += 1
+                else:
+                    break
+
+            # Parse the table
+            reformatted = _reformat_pipe_table(table_lines)
+            if reformatted:
+                result_lines.append(reformatted)
+            else:
+                # Fallback: keep original
+                result_lines.extend(table_lines)
+        else:
+            result_lines.append(lines[i])
+            i += 1
+
+    return "\n".join(result_lines)
+
+
+def _reformat_pipe_table(table_lines: list[str]) -> str | None:
+    """Reformat a list of pipe-delimited table lines into explicit format."""
+    if len(table_lines) < 2:
+        return None
+
+    # Parse cells from each row
+    parsed_rows: list[list[str]] = []
+    for line in table_lines:
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        # Skip separator rows (---|---|---)
+        if all(re.fullmatch(r"[-:]+", c) for c in cells if c):
+            continue
+        parsed_rows.append(cells)
+
+    if len(parsed_rows) < 2:
+        return None
+
+    headers = parsed_rows[0]
+    data_rows = parsed_rows[1:]
+
+    lines = [f"[headers: {' | '.join(headers)}]"]
+    for row in data_rows:
+        if not row:
+            continue
+        label = row[0] if row else ""
+        values = row[1:] if len(row) > 1 else []
+        if not label.strip():
+            continue
+        # Pair values with headers
+        pairs = []
+        for j, val in enumerate(values):
+            if val.strip() and j + 1 < len(headers):
+                pairs.append(f"{headers[j + 1]}: {val}")
+        if pairs:
+            lines.append(f"  {label} → {' | '.join(pairs)}")
+        else:
+            lines.append(f"  {label}")
+
+    return "\n".join(lines) if len(lines) > 1 else None

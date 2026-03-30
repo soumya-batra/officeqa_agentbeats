@@ -8,7 +8,7 @@ endpoint = "http://officeqa_agent:9019"
 [config]
 dataset_url = "https://raw.githubusercontent.com/databricks/officeqa/main/officeqa_full.csv"
 corpus_url = "https://github.com/databricks/officeqa/tree/main/treasury_bulletins_parsed"
-num_questions = 10
-difficulty = "easy"
+num_questions = 246
+difficulty = "all"
 tolerance = 0.0
-max_concurrent = 1
+max_concurrent = 2

@@ -12,14 +12,11 @@ RUN pip install --no-cache-dir \
     "uvicorn>=0.38.0" \
     "openai>=1.50.0" \
     "anthropic>=0.40.0" \
+    "google-genai>=1.0.0" \
     "faiss-cpu>=1.7.4" \
     "numpy>=1.26.0" \
     "tiktoken>=0.7.0" \
-    "rank-bm25>=0.2.2" \
-    "sentence-transformers>=3.0.0"
-
-# Pre-download cross-encoder model so it's baked into the image
-RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3')"
+    "rank-bm25>=0.2.2"
 
 COPY participant/src/ ./
 

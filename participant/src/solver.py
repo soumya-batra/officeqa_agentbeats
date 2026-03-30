@@ -8,58 +8,188 @@ from external_data import CPIData
 from formatting import canonicalize_final_answer, ensure_structured_response
 from json_source import load_page_contexts
 from llm import LLMClient
-from models import SolverResult
+from models import RetrievedContext, SolverResult
 from faiss_retriever import FaissRetriever
 from source_hints import parse_source_hints
+from table_parser import find_calendar_year_total, reformat_tables_in_context
 
 
 logger = logging.getLogger(__name__)
 
-PREPROCESS_SYSTEM_PROMPT = """You are a search query optimizer for US Treasury Bulletin documents.
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
 
-Given a user question, output a short retrieval query optimized for document search:
+DECOMPOSE_SYSTEM_PROMPT = """You are a search query optimizer for US Treasury Bulletin documents.
+
+Given a user question, decompose it into 1-3 retrieval queries optimized for document search.
+For simple lookups, output one query.  For multi-step questions, output sub-queries that each
+target a specific piece of information needed to answer the overall question.
+
+Rules per query:
 - 10-20 words
-- Resolves implicit time references (e.g., "1 year before World War 2" -> 1938)
-- Converts fiscal year notation (FY1934 -> fiscal year 1934)
-- Preserves table names, row labels, column names, specific years, dollar amounts, and named entities
-- Strips procedural filler ("what was", "find the", "calculate")
+- Resolve implicit time references (e.g., "1 year before World War 2" -> 1938)
+- Convert fiscal year notation (FY1934 -> fiscal year 1934)
+- Preserve table names, row labels, column names, specific years, dollar amounts
+- Strip procedural filler ("what was", "find the", "calculate")
 
-Output in JSON format:
+Output JSON (no markdown fences):
 {
-  "retrieval_query": "<your optimized query>"
+  "queries": ["<query 1>", "<query 2 if needed>"]
 }"""
 
-SYSTEM_PROMPT = """You are answering questions from Treasury documents using retrieved context.
+SYSTEM_PROMPT = """You are answering questions about U.S. Treasury Bulletin documents using retrieved context.
 
-Rules:
-- Always answer using the provided context.
-- If the question involves numerical reasoning, aggregation, comparison, or multi-step calculations, use the python tool.
-- Do not perform arithmetic mentally when precise computation is required.
-- For simple lookups, answer directly without using tools.
-- When using the python tool, show the final computed answer clearly.
+## CRITICAL: use python code for ALL data extraction AND calculations
+- ALWAYS use the python tool (code_execution) for EVERYTHING:
+  1. PARSING TABLES: Write Python code to parse the table text from the context. Extract values by matching row labels and column headers programmatically. NEVER eyeball or manually read numbers from tables.
+  2. ALL ARITHMETIC: ratios, percentages, sums, differences, averages, growth rates, rounding.
+- NEVER read a number from a table by eye — always write code that finds the row and column and extracts the value.
+- Show the final computed answer clearly in the code output.
+
+## Table parsing strategy
+The retrieved context contains text-formatted tables. To extract values:
+1. Split the table text into lines
+2. Identify the header row (contains column names like years or months)
+3. Find the target row by matching the row label from the question
+4. Extract the value at the correct column position
+5. Handle separators like "|" or multiple spaces between columns
+This approach avoids misreading adjacent rows or columns.
 
 ## Source priority
-1. Always retrieve figures directly from the Treasury Bulletin documents using file search.
-2. Use web search only for external data explicitly required by the question (e.g. CPI indices, exchange rates).
+1. Always extract figures directly from the retrieved Treasury Bulletin context.
+2. Use web search only for external data explicitly required by the question (e.g. CPI indices, exchange rates, inflation adjusters).
 3. Never rely on memorized values — always verify against the source documents.
 
 ## Calendar year vs fiscal year
-- Fiscal year: July 1 through June 30 (e.g. fiscal year 1940 = July 1939 – June 1940).
+- Fiscal year (pre-1977): July 1 through June 30 (e.g. FY1940 = July 1939 – June 1940).
 - Calendar year: January 1 through December 31 of that year.
 
 ## Precision
 - Preserve full numerical precision throughout; only round at the final step as instructed.
-- Pay close attention to the exact table name, row label, and column in the question — do not substitute a similar-sounding category.
+- Pay close attention to the exact table name, row label, and column in the question.
+- Do NOT substitute a similar-sounding category or adjacent row.
 
+## Page number questions
+- When asked for the page number containing certain data, report the page number printed on the physical page (typically a small number 1-100), NOT bulletin section codes like "B-462-B" or index numbers.
+- Page numbers appear at the top or bottom of each page as simple integers.
 
-Return your response in the following required format:
+## Answer format
+Do all your reasoning in your thinking. Keep your visible output SHORT.
+Return ONLY this:
 <REASONING>
-[steps and calculations]
+[1-2 sentence summary of your approach and the key data extracted]
 </REASONING>
 <FINAL_ANSWER>
-[canonical answer only: no prose, no markdown, no explanation]
+[canonical answer only: a single number or value, no units, no prose, no markdown, no explanation]
 </FINAL_ANSWER>
 """
+
+PLANNER_SYSTEM_PROMPT = """You are an expert question analyst for U.S. Treasury Bulletin research.
+
+Given a question, produce a structured analysis that will guide retrieval and answering.
+
+Output JSON (no markdown fences):
+{
+  "data_points": ["<specific data point 1 needed>", "<data point 2>"],
+  "table_names": ["<exact table name if mentioned, e.g. FFO-3, FFO-5>"],
+  "time_periods": ["<resolved time period, e.g. fiscal year 1934, February 2012, calendar year 1981>"],
+  "constraints": ["<inclusion/exclusion constraint 1>", "<constraint 2>"],
+  "answer_type": "<scalar|list|page_number|text>",
+  "unit": "<expected unit if specified, e.g. millions of dollars, percentage points, billions>",
+  "extra_queries": ["<additional retrieval query if the question needs data not obvious from the main question>"]
+}
+
+Rules:
+- Resolve ALL implicit time references (e.g. "1 year before WW2" -> "1938", "FY2013 budget proposal release month" -> "February 2012")
+- Extract EVERY inclusion/exclusion constraint (e.g. "excluding territories", "shouldn't contain revolving funds", "net of refunds")
+- Identify exact table names if the question references one (FFO-3, FFO-5, OFS-1, etc.)
+- Keep data_points specific: not "some value" but "total interest-bearing U.S. public debt September 1989"
+- extra_queries should target data the main question text wouldn't directly match in search"""
+
+VERIFIER_SYSTEM_PROMPT = """You are an answer auditor for U.S. Treasury Bulletin questions.
+
+You will receive:
+1. The original question
+2. A structured plan (constraints, required data points, expected answer type)
+3. The solver's reasoning and proposed answer
+
+Your job: check ONLY for clear structural violations. You do NOT have access to the source data, so you CANNOT verify whether specific numbers are correct.
+
+ONLY flag these specific error types:
+- CONSTRAINT VIOLATION: The solver explicitly added something the question said to EXCLUDE, or omitted something it said to INCLUDE. The violation must be obvious from the solver's own reasoning (e.g., "I added revolving funds" when the question says "exclude revolving funds").
+- FORMAT ERROR: The answer is a section code (like "B-462-B") when the question asks for a page number, or the answer includes prose when it should be a bare number.
+
+DO NOT flag:
+- Whether specific dollar amounts, percentages, or values are correct (you can't verify this)
+- Whether the solver used the right table or right row (you can't verify this)
+- Data interpretation disagreements
+- Anything you're uncertain about
+
+Output JSON (no markdown fences):
+{
+  "verdict": "PASS" or "FAIL",
+  "issues": ["<issue 1 if FAIL>"],
+  "correction_hint": "<specific guidance for how to fix the answer, if FAIL>"
+}
+
+When in doubt, ALWAYS output PASS. Only FAIL on unambiguous constraint violations visible in the reasoning."""
+
+REFINE_QUERY_PROMPT = """A question about U.S. Treasury Bulletins could not be fully answered because some data was missing from the retrieved context.
+
+Question: {question}
+
+Model's reasoning (showing what it looked for but could not find):
+{reasoning}
+
+Based on what specific data was missing, generate a focused retrieval query (10-20 words) to locate that data in the Treasury Bulletin corpus.  Focus on the exact table name, year, row label, or metric that was unavailable.
+
+Output JSON (no markdown fences):
+{{"query": "<your focused query>"}}"""
+
+# Patterns that indicate the model could not find what it needed.
+_LOW_CONFIDENCE_PATTERNS = [
+    "n/a",
+    "unable to determine",
+    "cannot find",
+    "not enough information",
+    "no data",
+    "not available",
+    "insufficient",
+    "does not include",
+    "not present in",
+    "cannot be determined",
+    "could not locate",
+    "no relevant",
+    "not provided",
+]
+
+_PAGE_NUMBER_RE = re.compile(
+    r"\b(?:page\s*number|what\s+(?:is\s+)?(?:the\s+)?page|which\s+page)\b", re.I
+)
+
+
+def _parse_json_robust(raw: str) -> dict:
+    """Parse JSON from LLM output, handling markdown fences and extra text."""
+    text = raw.strip()
+    # Strip markdown code fences
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Try to find JSON object within the text
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    raise json.JSONDecodeError("No valid JSON found", text, 0)
+
 
 class OfficeQASolver:
     def __init__(self, config: SolverConfig | None = None, llm_client: LLMClient | None = None):
@@ -68,58 +198,110 @@ class OfficeQASolver:
         self._retriever = FaissRetriever(self._config.corpus_dir, self._config.faiss_index_dir, self._config.retrieval_top_k)
         self._cpi_data = CPIData(self._config.cpi_data_path)
 
-    def _preprocess_question(self, core_question: str) -> tuple[str, str]:
-        """Call a cheap LLM to get an optimized retrieval query.
-
-        Returns (retrieval_query, _). Falls back to core_question on error.
-        """
-        try:
-            raw = self._llm_client.complete_cheap(
-                system_prompt=PREPROCESS_SYSTEM_PROMPT,
-                prompt=core_question,
-            )
-            parsed = json.loads(raw)
-            retrieval_query = parsed.get("retrieval_query") or core_question
-            print(f"[PREPROCESS] retrieval_query: {retrieval_query}")
-            return retrieval_query, retrieval_query
-        except Exception as exc:
-            logger.warning("Preprocess failed, using raw question: %s", exc)
-            return core_question, core_question
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     def solve_question(self, question: str) -> SolverResult:
         question_uid = self._extract_question_uid(question)
         source_hints = parse_source_hints(question)
         core_question = self._extract_core_question(question)
-        retrieval_query, _ = self._preprocess_question(core_question)
-        contexts = self._collect_contexts(retrieval_query, source_hints)
-        print("\n" + "="*80)
-        print(f"RETRIEVED CHUNKS ({len(contexts)} total):")
-        print("-"*80)
-        for i, ctx in enumerate(contexts, start=1):
-            print(f"[Chunk {i}] source={ctx.source}  score={ctx.score:.2f}")
-            print(ctx.content)
-            print("-"*40)
-        print("="*80 + "\n")
+        is_page_q = bool(_PAGE_NUMBER_RE.search(core_question))
+
+        # ── Agent 1: PLANNER ─────────────────────────────────────────
+        plan = self._plan_question(core_question)
+
+        # ── Agent 2: RETRIEVER (multi-strategy) ─────────────────────
+        sub_queries = self._decompose_question(core_question)
+        # Merge planner's extra queries with decomposed queries
+        if plan.get("extra_queries"):
+            for eq in plan["extra_queries"]:
+                if eq and eq not in sub_queries:
+                    sub_queries.append(eq)
+        # Also add table-name-targeted queries from the plan
+        for table_name in plan.get("table_names", []):
+            if table_name:
+                table_query = f"{table_name} Treasury Bulletin table"
+                if table_query not in sub_queries:
+                    sub_queries.append(table_query)
+        # For calendar-month-total questions, add month-specific queries
+        month_queries = self._generate_month_queries(core_question, plan)
+        if month_queries:
+            sub_queries.extend(month_queries)
+            print(f"[MONTH QUERIES] Added {len(month_queries)} month-specific queries")
+
+        has_month_queries = bool(month_queries)
+        contexts = self._collect_multi_query_contexts(sub_queries, source_hints, is_page_q, has_month_queries)
+
+        self._log_chunks(contexts)
         logger.info(
-            "Solving question with source_files=%s source_pages=%s contexts=%s",
+            "Solving question with source_files=%s source_pages=%s contexts=%s plan=%s",
             source_hints.source_files,
             source_hints.source_pages,
-            [context.source for context in contexts],
+            [c.source for c in contexts],
+            plan,
         )
+
         base_debug_payload = {
             "timestamp_utc": timestamp_utc(),
             "question_uid": question_uid,
             "question_prompt": question,
             "core_question": core_question,
-            "retrieval_query": retrieval_query,
+            "plan": plan,
+            "sub_queries": sub_queries,
             "source_hints": source_hints,
             "contexts": build_context_snapshot(contexts),
         }
+
         try:
-            prompt = self._build_prompt(core_question, contexts)
+            # ── Reformat tables for LLM readability ──────────────────
+            contexts = self._reformat_contexts(contexts)
+
+            # ── Table extraction ─────────────────────────────────────
+            table_data = self._extract_table_data(core_question, contexts)
+            if table_data:
+                print(f"[TABLE EXTRACT]\n{table_data}")
+
+            # ── Agent 3: SOLVER ──────────────────────────────────────
+            prompt = self._build_prompt(core_question, contexts, is_page_q, table_data=table_data, plan=plan)
             raw_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=prompt)
             reasoning, final_answer = ensure_structured_response(raw_response)
+
+            # ── Agent 3b: RETRY on low-confidence ────────────────────
+            if self._is_low_confidence(final_answer, reasoning):
+                logger.info("Low-confidence answer detected, retrying with refined retrieval")
+                refined_query = self._get_refined_query(core_question, reasoning)
+                extra_contexts = self._collect_single_query_contexts(refined_query, source_hints)
+                merged = self._merge_contexts(contexts, extra_contexts)
+                retry_prompt = self._build_retry_prompt(core_question, merged, reasoning)
+                raw_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=retry_prompt)
+                reasoning, final_answer = ensure_structured_response(raw_response)
+                contexts = merged
+
+            # ── Agent 4: VERIFIER ────────────────────────────────────
+            verification = self._verify_answer(core_question, plan, reasoning, final_answer)
+            if verification.get("verdict") == "FAIL":
+                logger.info("Verifier FAILED: %s", verification.get("issues"))
+                correction_hint = verification.get("correction_hint", "")
+                try:
+                    correction_prompt = self._build_correction_prompt(
+                        core_question, contexts, reasoning, final_answer, correction_hint, plan,
+                    )
+                    corrected_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=correction_prompt)
+                    corrected_reasoning, corrected_answer = ensure_structured_response(corrected_response)
+                    # Only use corrected answer if it's not a low-confidence response
+                    if not self._is_low_confidence(corrected_answer, corrected_reasoning):
+                        raw_response = corrected_response
+                        reasoning = corrected_reasoning
+                        final_answer = corrected_answer
+                    else:
+                        logger.info("Correction produced low-confidence answer, keeping original")
+                except Exception as exc:
+                    logger.warning("Correction failed, keeping original answer: %s", exc)
+
+            # ── Post-process ─────────────────────────────────────────
             final_answer = canonicalize_final_answer(question, final_answer)
+
             result = SolverResult(
                 final_answer=final_answer,
                 reasoning=reasoning,
@@ -131,12 +313,14 @@ class OfficeQASolver:
                 {
                     **base_debug_payload,
                     "route": "model",
+                    "verification": verification,
                     "final_answer": final_answer,
                     "reasoning": reasoning,
                     "raw_response": raw_response,
                 },
             )
             return result
+
         except Exception as exc:
             self._write_debug_artifact(
                 question_uid or self._fallback_artifact_id(core_question),
@@ -147,6 +331,426 @@ class OfficeQASolver:
                 },
             )
             raise
+
+    # ------------------------------------------------------------------
+    # Agent 1: Planner
+    # ------------------------------------------------------------------
+
+    def _plan_question(self, core_question: str) -> dict:
+        """Use a cheap model to produce a structured plan from the question."""
+        try:
+            raw = self._llm_client.complete_cheap(
+                system_prompt=PLANNER_SYSTEM_PROMPT,
+                prompt=core_question,
+            )
+            plan = _parse_json_robust(raw)
+            print(f"[PLAN] {json.dumps(plan, indent=2)}")
+            return plan
+        except Exception as exc:
+            logger.warning("Planner failed: %s", exc)
+            return {}
+
+    # ------------------------------------------------------------------
+    # Month-specific retrieval for calendar year questions
+    # ------------------------------------------------------------------
+
+    _MONTHS = ["January", "February", "March", "April", "May", "June",
+               "July", "August", "September", "October", "November", "December"]
+
+    @staticmethod
+    def _generate_month_queries(question: str, plan: dict) -> list[str]:
+        """For questions about 'all individual calendar months in YEAR',
+        generate month-specific retrieval queries to ensure full coverage.
+
+        Only triggers for precise patterns with 1-2 explicit years to avoid
+        flooding retrieval with hundreds of queries.
+        """
+        lowered = question.lower()
+        # Only trigger for the most specific patterns
+        if "all individual calendar months" not in lowered:
+            return []
+
+        # Extract years that appear RIGHT AFTER "months in"
+        # e.g., "all individual calendar months in 1953"
+        year_matches = re.findall(r"calendar months in (\d{4})", lowered)
+        if not year_matches or len(year_matches) > 2:
+            return []
+
+        # Extract the topic
+        topic = ""
+        if plan.get("data_points"):
+            topic = plan["data_points"][0]
+        else:
+            for phrase in ["national defense", "budget expenditures", "public debt",
+                           "receipts", "outlays", "interest"]:
+                if phrase in lowered:
+                    topic = phrase
+                    break
+
+        queries = []
+        for year in set(year_matches):
+            for month in OfficeQASolver._MONTHS:
+                queries.append(f"{topic} {month} {year} Treasury Bulletin")
+        return queries
+
+    # ------------------------------------------------------------------
+    # Question decomposition (multi-query)
+    # ------------------------------------------------------------------
+
+    def _decompose_question(self, core_question: str) -> list[str]:
+        """Use a cheap model to decompose the question into 1-3 retrieval sub-queries."""
+        try:
+            raw = self._llm_client.complete_cheap(
+                system_prompt=DECOMPOSE_SYSTEM_PROMPT,
+                prompt=core_question,
+            )
+            parsed = _parse_json_robust(raw)
+            queries = parsed.get("queries") or [core_question]
+            # Sanity: at most 3 sub-queries, each non-empty
+            queries = [q.strip() for q in queries[:3] if q.strip()]
+            if not queries:
+                queries = [core_question]
+            print(f"[DECOMPOSE] sub-queries: {queries}")
+            return queries
+        except Exception as exc:
+            logger.warning("Decompose failed, using raw question: %s", exc)
+            return [core_question]
+
+    # ------------------------------------------------------------------
+    # Retrieval helpers
+    # ------------------------------------------------------------------
+
+    def _collect_multi_query_contexts(
+        self,
+        queries: list[str],
+        source_hints,
+        is_page_question: bool,
+        has_month_queries: bool = False,
+    ) -> list[RetrievedContext]:
+        """Retrieve for each sub-query and merge via deduplication + score."""
+        all_contexts: list[RetrievedContext] = []
+        seen_queries: set[str] = set()
+
+        for query in queries:
+            if query in seen_queries:
+                continue
+            seen_queries.add(query)
+            all_contexts.extend(self._collect_single_query_contexts(query, source_hints))
+
+        # For page-number questions, also load JSON page contexts if available
+        if is_page_question and source_hints.source_files:
+            all_contexts.extend(
+                load_page_contexts(
+                    self._config.parsed_json_dir,
+                    source_hints.source_files,
+                    source_hints.source_pages,
+                    queries[0],
+                    top_k=10,
+                )
+            )
+
+        limit = self._context_limit(source_hints, has_month_queries=has_month_queries)
+        return self._dedup_and_rank(all_contexts, limit)
+
+    def _collect_single_query_contexts(self, query: str, source_hints) -> list[RetrievedContext]:
+        """Retrieve contexts for a single query string."""
+        # Only compute embedding if FAISS index is available
+        query_vec = None
+        if self._retriever._index is not None:
+            query_vec = self._retriever._embed_query(query)
+        contexts: list[RetrievedContext] = []
+        if source_hints.source_files:
+            contexts.extend(
+                self._retriever.retrieve_by_source_files(source_hints.source_files, query, query_vec)
+            )
+            contexts.extend(
+                load_page_contexts(
+                    self._config.parsed_json_dir,
+                    source_hints.source_files,
+                    source_hints.source_pages,
+                    query,
+                    top_k=8,
+                )
+            )
+        contexts.extend(self._retriever.retrieve(query, query_vec))
+        return contexts
+
+    def _context_limit(self, source_hints, has_month_queries: bool = False) -> int:
+        base = self._config.retrieval_top_k
+        if has_month_queries:
+            return max(base + 15, 30)  # Need more context for monthly data
+        if source_hints.source_files:
+            return max(base + 10, 20)
+        return base + 5
+
+    @staticmethod
+    def _dedup_and_rank(
+        contexts: list[RetrievedContext], limit: int
+    ) -> list[RetrievedContext]:
+        deduped: dict[tuple, RetrievedContext] = {}
+        for ctx in contexts:
+            key = (ctx.source, ctx.content[:500])
+            existing = deduped.get(key)
+            if existing is None or ctx.score > existing.score:
+                deduped[key] = ctx
+        return sorted(deduped.values(), key=lambda c: c.score, reverse=True)[:limit]
+
+    @staticmethod
+    def _merge_contexts(
+        existing: list[RetrievedContext], new: list[RetrievedContext]
+    ) -> list[RetrievedContext]:
+        deduped: dict[tuple, RetrievedContext] = {}
+        for ctx in existing:
+            key = (ctx.source, ctx.content[:500])
+            deduped[key] = ctx
+        for ctx in new:
+            key = (ctx.source, ctx.content[:500])
+            if key not in deduped or ctx.score > deduped[key].score:
+                deduped[key] = ctx
+        return sorted(deduped.values(), key=lambda c: c.score, reverse=True)
+
+    # ------------------------------------------------------------------
+    # Confidence check & agentic retry
+    # ------------------------------------------------------------------
+
+    def _is_low_confidence(self, answer: str, reasoning: str) -> bool:
+        # With concise reasoning (1-2 sentences), the summary often mentions
+        # missing data even when a valid answer was found.  Only check the
+        # final answer itself to avoid false-positive retries.
+        answer_lower = answer.lower().strip()
+        return any(p in answer_lower for p in _LOW_CONFIDENCE_PATTERNS)
+
+    def _get_refined_query(self, question: str, reasoning: str) -> str:
+        """Ask the cheap model what to search for based on the failed reasoning."""
+        try:
+            raw = self._llm_client.complete_cheap(
+                system_prompt="You generate focused document-retrieval queries. Output JSON only.",
+                prompt=REFINE_QUERY_PROMPT.format(question=question, reasoning=reasoning[:2000]),
+            )
+            parsed = _parse_json_robust(raw)
+            refined = (parsed.get("query") or "").strip()
+            if refined:
+                print(f"[RETRY] refined query: {refined}")
+                return refined
+        except Exception as exc:
+            logger.warning("Refine query failed: %s", exc)
+        return question
+
+    # ------------------------------------------------------------------
+    # Table reformatting (make tables LLM-readable)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reformat_contexts(contexts: list[RetrievedContext]) -> list[RetrievedContext]:
+        """Reformat pipe tables in retrieved contexts to explicit row-value format."""
+        reformatted = []
+        for ctx in contexts:
+            try:
+                new_content = reformat_tables_in_context(ctx.content)
+                reformatted.append(RetrievedContext(
+                    content=new_content,
+                    source=ctx.source,
+                    score=ctx.score,
+                ))
+            except Exception:
+                reformatted.append(ctx)
+        return reformatted
+
+    # ------------------------------------------------------------------
+    # Table extraction (structured data for LLM)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_table_data(question: str, contexts: list[RetrievedContext]) -> str:
+        """Pre-extract structured table data from retrieved contexts.
+
+        Only extracts calendar year totals (precise computation).
+        General row ranking is too noisy and can mislead the LLM.
+        """
+        lines: list[str] = []
+
+        # Try calendar year total extraction (handles monthly sum questions)
+        try:
+            cal_result = find_calendar_year_total(question, contexts)
+            if cal_result is not None:
+                total, explanation = cal_result
+                lines.append(f"HINT — Calendar year total (sum of monthly values): {total:,.2f}")
+                lines.append(f"  ({explanation})")
+                lines.append("  Verify this against the source context before using.")
+                lines.append("")
+        except Exception:
+            pass
+
+        return "\n".join(lines) if lines else ""
+
+    # ------------------------------------------------------------------
+    # Agent 4: Verifier
+    # ------------------------------------------------------------------
+
+    def _verify_answer(self, question: str, plan: dict, reasoning: str, answer: str) -> dict:
+        """Use a cheap model to audit the answer against the question and plan."""
+        try:
+            prompt = (
+                f"QUESTION:\n{question}\n\n"
+                f"PLAN:\n{json.dumps(plan, indent=2)}\n\n"
+                f"SOLVER REASONING:\n{reasoning[:3000]}\n\n"
+                f"PROPOSED ANSWER:\n{answer}"
+            )
+            raw = self._llm_client.complete_cheap(
+                system_prompt=VERIFIER_SYSTEM_PROMPT,
+                prompt=prompt,
+            )
+            result = _parse_json_robust(raw)
+            verdict = result.get("verdict", "PASS")
+            print(f"[VERIFY] verdict={verdict} issues={result.get('issues', [])}")
+            return result
+        except Exception as exc:
+            logger.warning("Verifier failed: %s", exc)
+            return {"verdict": "PASS"}
+
+    # ------------------------------------------------------------------
+    # Prompt builders
+    # ------------------------------------------------------------------
+
+    def _build_correction_prompt(
+        self,
+        question: str,
+        contexts: list[RetrievedContext],
+        prior_reasoning: str,
+        prior_answer: str,
+        correction_hint: str,
+        plan: dict,
+    ) -> str:
+        """Build a prompt for the correction pass after verifier found issues."""
+        constraints_text = ""
+        if plan.get("constraints"):
+            constraints_text = "\n".join(f"- {c}" for c in plan["constraints"])
+
+        lines = [
+            "A previous answer to this question was flagged by a verifier as potentially incorrect.",
+            "",
+            "VERIFIER FEEDBACK:",
+            correction_hint,
+            "",
+        ]
+        if constraints_text:
+            lines.extend([
+                "QUESTION CONSTRAINTS (from analysis):",
+                constraints_text,
+                "",
+            ])
+        lines.extend([
+            "Previous reasoning (may contain errors):",
+            prior_reasoning[:2000],
+            "",
+            f"Previous answer (flagged): {prior_answer}",
+            "",
+            "INSTRUCTIONS:",
+            "- Re-read the question carefully, paying close attention to the verifier feedback.",
+            "- Re-examine the retrieved context and correct any errors.",
+            "- Follow all constraints identified above.",
+            "",
+            "FINAL_ANSWER rules:",
+            "- If the answer is a single scalar, output only that scalar.",
+            "- Do not add prose, bullets, markdown, or explanations inside FINAL_ANSWER.",
+            "- Use square brackets only if the question explicitly asks for a bracketed list.",
+            "",
+            "Question:",
+            question,
+        ])
+        if contexts:
+            lines.extend(["", "Retrieved context:"])
+            for index, context in enumerate(contexts, start=1):
+                lines.extend([
+                    f"[Source {index}] {context.source} (score={context.score:.1f})",
+                    context.content,
+                    "",
+                ])
+        return "\n".join(lines).strip()
+
+    def _build_prompt(self, question: str, contexts: list[RetrievedContext], is_page_question: bool = False, table_data: str = "", plan: dict | None = None) -> str:
+        lines = [
+            "Solve the following OfficeQA question using the best available evidence.",
+            "",
+            "FINAL_ANSWER rules:",
+            "- Output ONLY the bare number or value. No units (no 'million', 'dollars', etc.), no prose, no markdown.",
+            "- If the question says 'in millions of dollars', the answer is just the number (e.g., '507' not '507 million').",
+            "- Use square brackets only if the question explicitly asks for a bracketed list.",
+        ]
+        if is_page_question:
+            lines.extend([
+                "",
+                "PAGE NUMBER GUIDANCE:",
+                "- The answer is the physical page number printed on the page (a small integer, usually 1-100).",
+                "- Do NOT report bulletin section codes (like 'B-462-B') or index numbers.",
+                "- Look for the page number at the top or bottom of the page content.",
+            ])
+        # Inject plan data_points as row-label guidance
+        if plan and plan.get("data_points"):
+            lines.extend(["", "EXACT DATA TO FIND (match these labels precisely in the tables):"])
+            for dp in plan["data_points"]:
+                lines.append(f"  - {dp}")
+        if plan and plan.get("constraints"):
+            lines.extend(["", "QUESTION CONSTRAINTS:"])
+            for c in plan["constraints"]:
+                lines.append(f"  - {c}")
+        lines.extend([
+            "",
+            "Question:",
+            question,
+        ])
+        if table_data:
+            lines.extend([
+                "",
+                "STRUCTURED TABLE DATA (pre-extracted from retrieved context — use these values when they match your query):",
+                table_data,
+            ])
+        if contexts:
+            lines.extend(["", "Retrieved context:"])
+            for index, context in enumerate(contexts, start=1):
+                lines.extend([
+                    f"[Source {index}] {context.source} (score={context.score:.1f})",
+                    context.content,
+                    "",
+                ])
+        else:
+            lines.extend([
+                "",
+                "No local corpus context was retrieved. If tools are enabled, search carefully.",
+            ])
+        return "\n".join(lines).strip()
+
+    def _build_retry_prompt(
+        self, question: str, contexts: list[RetrievedContext], prior_reasoning: str
+    ) -> str:
+        lines = [
+            "A previous attempt to answer this question failed because some data was missing.",
+            "Additional context has now been retrieved. Use ALL provided context to answer.",
+            "",
+            "Previous reasoning (for reference — the answer was incomplete/wrong):",
+            prior_reasoning[:3000],
+            "",
+            "FINAL_ANSWER rules:",
+            "- If the answer is a single scalar, output only that scalar.",
+            "- Do not add prose, bullets, markdown, or explanations inside FINAL_ANSWER.",
+            "- Use square brackets only if the question explicitly asks for a bracketed list.",
+            "",
+            "Question:",
+            question,
+        ]
+        if contexts:
+            lines.extend(["", "Retrieved context:"])
+            for index, context in enumerate(contexts, start=1):
+                lines.extend([
+                    f"[Source {index}] {context.source} (score={context.score:.1f})",
+                    context.content,
+                    "",
+                ])
+        return "\n".join(lines).strip()
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
 
     def _extract_core_question(self, question: str) -> str:
         lines: list[str] = []
@@ -180,57 +784,13 @@ class OfficeQASolver:
         normalized = re.sub(r"[^a-z0-9]+", "_", core_question.lower()).strip("_")
         return normalized[:80] or "question"
 
-    def _collect_contexts(self, retrieval_query: str, source_hints) -> list:
-        query_vec = self._retriever._embed_query(retrieval_query)
-        contexts = []
-        if source_hints.source_files:
-            contexts.extend(self._retriever.retrieve_by_source_files(source_hints.source_files, retrieval_query, query_vec))  # type: ignore[arg-type]
-            contexts.extend(
-                load_page_contexts(
-                    self._config.parsed_json_dir,
-                    source_hints.source_files,
-                    source_hints.source_pages,
-                    retrieval_query,
-                    top_k=8,
-                )
-            )
-        contexts.extend(self._retriever.retrieve(retrieval_query, query_vec))
-        limit = max(self._config.retrieval_top_k + 7, 10) if source_hints.source_files else self._config.retrieval_top_k + 3
-        deduped = {}
-        for context in contexts:
-            key = (context.source, context.content[:500])
-            existing = deduped.get(key)
-            if existing is None or context.score > existing.score:
-                deduped[key] = context
-        return sorted(deduped.values(), key=lambda context: context.score, reverse=True)[:limit]
-
-    def _build_prompt(self, question: str, contexts) -> str:
-        lines = [
-            "Solve the following OfficeQA question using the best available evidence.",
-            "",
-            "FINAL_ANSWER rules:",
-            "- If the answer is a single scalar, output only that scalar.",
-            "- Do not add prose, bullets, markdown, or explanations inside FINAL_ANSWER.",
-            "- Use square brackets only if the question explicitly asks for a bracketed list.",
-            "",
-            "Question:",
-            question,
-        ]
-        if contexts:
-            lines.extend(["", "Retrieved context:"])
-            for index, context in enumerate(contexts, start=1):
-                lines.extend(
-                    [
-                        f"[Source {index}] {context.source} (score={context.score:.1f})",
-                        context.content,
-                        "",
-                    ]
-                )
-        else:
-            lines.extend(
-                [
-                    "",
-                    "No local corpus context was retrieved. If tools are enabled, search carefully.",
-                ]
-            )
-        return "\n".join(lines).strip()
+    @staticmethod
+    def _log_chunks(contexts: list[RetrievedContext]) -> None:
+        print("\n" + "=" * 80)
+        print(f"RETRIEVED CHUNKS ({len(contexts)} total):")
+        print("-" * 80)
+        for i, ctx in enumerate(contexts, start=1):
+            print(f"[Chunk {i}] source={ctx.source}  score={ctx.score:.2f}")
+            print(ctx.content[:500])
+            print("-" * 40)
+        print("=" * 80 + "\n")
