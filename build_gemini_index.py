@@ -13,7 +13,8 @@ import sys
 
 import numpy as np
 
-os.environ.setdefault("GOOGLE_API_KEY", "REDACTED")
+if not os.environ.get("GOOGLE_API_KEY"):
+    raise RuntimeError("Set GOOGLE_API_KEY environment variable before running")
 
 GEMINI_MODEL = "gemini-embedding-001"
 CHUNKS_PATH = "faiss_index/chunks.json"
