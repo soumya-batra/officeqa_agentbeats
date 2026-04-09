@@ -1,10 +1,19 @@
 {
-  "manifest_version": "0.3.0",
+  "manifest_version": "0.1.0",
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "google_api_key": { "type": "string", "secret": true }
+    },
+    "required": ["google_api_key"],
+    "additionalProperties": false
+  },
   "program": {
     "image": "ghcr.io/soumya-batra/officeqa-agent:latest",
     "entrypoint": ["python", "server.py", "--host", "0.0.0.0", "--port", "9019"],
     "env": {
       "PYTHONUNBUFFERED": "1",
+      "GOOGLE_API_KEY": "${config.google_api_key}",
       "LLM_PROVIDER": "gemini",
       "GEMINI_MODEL": "gemini-3-flash-preview",
       "ENABLE_WEB_SEARCH": "true",
@@ -21,5 +30,8 @@
   },
   "exports": {
     "a2a": "a2a"
+  },
+  "metadata": {
+    "agentbeats_id": "019d7202-fad7-71f0-9a15-62bb3faa4104"
   }
 }
