@@ -1,0 +1,25 @@
+{
+  "manifest_version": "0.3.0",
+  "program": {
+    "image": "ghcr.io/soumya-batra/officeqa-agent:latest",
+    "entrypoint": ["python", "server.py", "--host", "0.0.0.0", "--port", "9019"],
+    "env": {
+      "PYTHONUNBUFFERED": "1",
+      "LLM_PROVIDER": "gemini",
+      "GEMINI_MODEL": "gemini-3-flash-preview",
+      "ENABLE_WEB_SEARCH": "true",
+      "REASONING_EFFORT": "medium",
+      "CORPUS_DIR": "/app/corpus/transformed",
+      "FAISS_INDEX_DIR": "/app/faiss_index"
+    },
+    "network": {
+      "endpoints": [{ "name": "a2a_endpoint", "port": 9019 }]
+    }
+  },
+  "provides": {
+    "a2a": { "kind": "a2a", "endpoint": "a2a_endpoint" }
+  },
+  "exports": {
+    "a2a": "a2a"
+  }
+}
