@@ -202,7 +202,12 @@ class OfficeQASolver:
     # Main entry point
     # ------------------------------------------------------------------
 
+    QUESTION_DEADLINE_SECS = 110  # must return before executor's 115s hard timeout
+
     def solve_question(self, question: str) -> SolverResult:
+        import time as _time
+        _deadline = _time.monotonic() + self.QUESTION_DEADLINE_SECS
+
         question_uid = self._extract_question_uid(question)
         source_hints = parse_source_hints(question)
         core_question = self._extract_core_question(question)
@@ -267,37 +272,45 @@ class OfficeQASolver:
             raw_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=prompt)
             reasoning, final_answer = ensure_structured_response(raw_response)
 
-            # ── Agent 3b: RETRY on low-confidence ────────────────────
-            if self._is_low_confidence(final_answer, reasoning):
+            # ── Agent 3b: RETRY on low-confidence (skip if running out of time) ──
+            if _time.monotonic() < _deadline and self._is_low_confidence(final_answer, reasoning):
                 logger.info("Low-confidence answer detected, retrying with refined retrieval")
-                refined_query = self._get_refined_query(core_question, reasoning)
-                extra_contexts = self._collect_single_query_contexts(refined_query, source_hints)
-                merged = self._merge_contexts(contexts, extra_contexts)
-                retry_prompt = self._build_retry_prompt(core_question, merged, reasoning)
-                raw_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=retry_prompt)
-                reasoning, final_answer = ensure_structured_response(raw_response)
-                contexts = merged
-
-            # ── Agent 4: VERIFIER ────────────────────────────────────
-            verification = self._verify_answer(core_question, plan, reasoning, final_answer)
-            if verification.get("verdict") == "FAIL":
-                logger.info("Verifier FAILED: %s", verification.get("issues"))
-                correction_hint = verification.get("correction_hint", "")
                 try:
-                    correction_prompt = self._build_correction_prompt(
-                        core_question, contexts, reasoning, final_answer, correction_hint, plan,
-                    )
-                    corrected_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=correction_prompt)
-                    corrected_reasoning, corrected_answer = ensure_structured_response(corrected_response)
-                    # Only use corrected answer if it's not a low-confidence response
-                    if not self._is_low_confidence(corrected_answer, corrected_reasoning):
-                        raw_response = corrected_response
-                        reasoning = corrected_reasoning
-                        final_answer = corrected_answer
-                    else:
-                        logger.info("Correction produced low-confidence answer, keeping original")
+                    refined_query = self._get_refined_query(core_question, reasoning)
+                    extra_contexts = self._collect_single_query_contexts(refined_query, source_hints)
+                    merged = self._merge_contexts(contexts, extra_contexts)
+                    retry_prompt = self._build_retry_prompt(core_question, merged, reasoning)
+                    raw_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=retry_prompt)
+                    reasoning, final_answer = ensure_structured_response(raw_response)
+                    contexts = merged
                 except Exception as exc:
-                    logger.warning("Correction failed, keeping original answer: %s", exc)
+                    logger.warning("Retry failed, keeping original answer: %s", exc)
+            elif _time.monotonic() >= _deadline:
+                logger.warning("Skipping retry — deadline approaching")
+
+            # ── Agent 4: VERIFIER (skip if running out of time) ──────
+            verification = {}
+            if _time.monotonic() < _deadline:
+                verification = self._verify_answer(core_question, plan, reasoning, final_answer)
+                if verification.get("verdict") == "FAIL" and _time.monotonic() < _deadline:
+                    logger.info("Verifier FAILED: %s", verification.get("issues"))
+                    correction_hint = verification.get("correction_hint", "")
+                    try:
+                        correction_prompt = self._build_correction_prompt(
+                            core_question, contexts, reasoning, final_answer, correction_hint, plan,
+                        )
+                        corrected_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=correction_prompt)
+                        corrected_reasoning, corrected_answer = ensure_structured_response(corrected_response)
+                        if not self._is_low_confidence(corrected_answer, corrected_reasoning):
+                            raw_response = corrected_response
+                            reasoning = corrected_reasoning
+                            final_answer = corrected_answer
+                        else:
+                            logger.info("Correction produced low-confidence answer, keeping original")
+                    except Exception as exc:
+                        logger.warning("Correction failed, keeping original answer: %s", exc)
+            else:
+                logger.warning("Skipping verifier — deadline approaching")
 
             # ── Post-process ─────────────────────────────────────────
             final_answer = canonicalize_final_answer(question, final_answer)
