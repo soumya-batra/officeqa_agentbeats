@@ -15,5 +15,3 @@ uv.lock
 amber-demo
 faiss_index
 treasury_bulletins_transformed
-.docker-corpus
-.docker-faiss
