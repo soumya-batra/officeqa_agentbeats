@@ -22,7 +22,7 @@ cp faiss_index/year_index.json     .docker-faiss/
 echo "Staged corpus (~367 MB) + FAISS index (~2.4 GB) into build context"
 
 # --- Build ---
-docker build -f Dockerfile.officeqa-agent -t "$IMAGE" .
+docker build --platform linux/amd64 -f Dockerfile.officeqa-agent -t "$IMAGE" .
 
 # --- Clean up staging dirs ---
 rm -rf .docker-corpus .docker-faiss
