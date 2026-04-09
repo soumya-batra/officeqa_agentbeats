@@ -239,7 +239,8 @@ class LLMClient:
         tools = []
         if self._config.enable_web_search:
             tools.append(genai_types.Tool(google_search=genai_types.GoogleSearch()))
-        tools.append(genai_types.Tool(code_execution=genai_types.ToolCodeExecution()))
+        # code_execution disabled — suspected cause of hanging in Docker env
+        # tools.append(genai_types.Tool(code_execution=genai_types.ToolCodeExecution()))
 
         config = genai_types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -274,7 +275,7 @@ class LLMClient:
                     "429" in str(e) or "rate" in err_str or "quota" in err_str
                     or "resource_exhausted" in err_str or "disconnected" in err_str
                     or "remoteprotocolerror" in err_str or "connection" in err_str
-                    or "500" in str(e) or "503" in str(e) or "unavailable" in err_str
+                    or "500" in str(e) or "503" in str(e) or "504" in str(e) or "unavailable" in err_str
                     or "internal" in err_str or "too long" in err_str
                     or "exceeds the maximum" in err_str
                 )
