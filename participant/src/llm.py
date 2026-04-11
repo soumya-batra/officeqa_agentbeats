@@ -239,8 +239,7 @@ class LLMClient:
         tools = []
         if self._config.enable_web_search:
             tools.append(genai_types.Tool(google_search=genai_types.GoogleSearch()))
-        # code_execution disabled — suspected cause of hanging in Docker env
-        # tools.append(genai_types.Tool(code_execution=genai_types.ToolCodeExecution()))
+        tools.append(genai_types.Tool(code_execution=genai_types.ToolCodeExecution()))
 
         config = genai_types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -249,8 +248,8 @@ class LLMClient:
         )
         if self._config.reasoning_effort:
             config.thinking_config = genai_types.ThinkingConfig(
-                thinking_budget={"low": 1024, "medium": 8192, "high": 16384}.get(
-                    self._config.reasoning_effort, 8192
+                thinking_budget={"low": 4096, "medium": 8192, "high": 16384}.get(
+                    self._config.reasoning_effort, 4096
                 )
             )
 
@@ -264,11 +263,19 @@ class LLMClient:
                 )
                 # Extract text parts (skip thinking parts)
                 parts = []
+                all_part_kinds = []
                 for candidate in response.candidates or []:
                     for part in candidate.content.parts or []:
+                        all_part_kinds.append(type(part).__name__)
                         if hasattr(part, "text") and part.text:
                             parts.append(part.text)
-                return "\n".join(parts) if parts else (response.text or "")
+                result = "\n".join(parts) if parts else (response.text or "")
+                if not result.strip():
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Gemini returned empty text. Part kinds: %s", all_part_kinds
+                    )
+                return result
             except Exception as e:
                 err_str = str(e).lower()
                 retryable = (
@@ -278,6 +285,7 @@ class LLMClient:
                     or "500" in str(e) or "503" in str(e) or "504" in str(e) or "unavailable" in err_str
                     or "internal" in err_str or "too long" in err_str
                     or "exceeds the maximum" in err_str
+                    or "timed out" in err_str or "timeout" in err_str
                 )
                 if retryable:
                     wait = min(2 ** attempt * 5, 30)

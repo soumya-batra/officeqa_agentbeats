@@ -73,14 +73,8 @@ class Executor(AgentExecutor):
                 break
 
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(self._solver.solve_question, question_text),
-                timeout=115,
-            )
+            result = await asyncio.to_thread(self._solver.solve_question, question_text)
             response = render_solver_result(result)
-        except asyncio.TimeoutError:
-            logger.warning("Solver timed out after 115s for task %s", task_id)
-            response = "<FINAL_ANSWER>Unable to determine</FINAL_ANSWER>"
         except Exception as e:
             logger.exception(f"LLM call failed: {e}")
             response = f"<FINAL_ANSWER>Error: {e}</FINAL_ANSWER>"

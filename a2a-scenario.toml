@@ -11,4 +11,4 @@ corpus_url = "https://github.com/databricks/officeqa/tree/main/treasury_bulletin
 num_questions = 25
 difficulty = "all"
 tolerance = 0.0
-max_concurrent = 2
+max_concurrent = 1
