@@ -1,305 +1,133 @@
-# OfficeQA Benchmark AgentBeats Implementation
+# OfficeQA Purple Agent
 
+A purple agent for the [OfficeQA benchmark](https://github.com/databricks/officeqa) on the [AgentBeats](https://agentbeats.dev) platform. Answers complex questions about U.S. Treasury Bulletin documents (1939-2025) using retrieval-augmented generation.
 
-**OfficeQA** is a grounded reasoning benchmark that tests AI systems on complex questions requiring extraction and computation from real-world financial documents (U.S. Treasury Bulletins from 1939-2025).
+## How It Works
 
-This submission implements the OfficeQA benchmark on the AgentBeats platform, providing:
-- A **Green Agent (Evaluator)** in `judge/` that orchestrates evaluations
-- A **Baseline Purple Agent** in `participant/` for demonstration
-- Automated scoring using fuzzy matching with configurable tolerance
+1. **Plan** — Analyzes the question to identify data points, table names, time periods, and constraints
+2. **Decompose** — Breaks the question into 1-3 focused retrieval queries
+3. **Retrieve** — Hybrid FAISS (semantic) + BM25 (keyword) search over 150K corpus chunks
+4. **Solve** — GPT 5.4 with code interpreter parses tables, runs calculations, and produces the answer
+5. **Format** — Canonicalizes the answer for judge compatibility
 
-## Benchmark Details
+## Score
 
-| Metric | Value |
-|--------|-------|
-| Total Questions | 246 |
-| Corpus | U.S. Treasury Bulletins |
-| Time Span | January 1939 - September 2025 |
-| Difficulty Levels | Easy, Hard |
-| Question Types | Extraction, Calculation, Statistical Analysis |
+| Config | Score | Accuracy |
+|--------|-------|----------|
+| GPT 5.4 + FAISS/BM25 | 97/246 | 39.4% |
 
-### Question Categories
-- Simple data extraction
-- Multi-year calculations with inflation adjustments
-- Statistical analysis (regression, correlation, standard deviation)
-- Time series forecasting
-- Complex financial metrics (VaR, weighted averages)
+## Project Structure
 
-## Quick Start
+```
+participant/src/
+  solver.py          # Main solving pipeline (plan -> decompose -> retrieve -> solve -> format)
+  faiss_retriever.py # Hybrid FAISS + BM25 retrieval
+  llm.py             # LLM client (OpenAI, Gemini, Anthropic)
+  config.py          # Environment-based configuration
+  formatting.py      # Final answer normalization
+  server.py          # A2A server
+  executor.py        # A2A request handling
+judge/src/           # Green agent (evaluator) — loads questions, scores answers
+amber-manifest.json  # Amber manifest for AgentBeats Quick Submit
+Dockerfile.officeqa-agent  # Production Docker image (corpus + FAISS baked in)
+build.sh             # Build script for production image
+```
 
-Run the full evaluation in 4 steps:
+## Quick Start (Local)
 
-### Step 1: Clone the repository
 ```bash
-git clone https://github.com/arnavsinghvi11/officeqa_agentbeats.git
+git clone https://github.com/soumya-batra/officeqa_agentbeats.git
 cd officeqa_agentbeats
-```
 
-### Step 2: Create your `.env` file  - (sample with gpt-5.2)
-```bash
-echo "LLM_PROVIDER=openai" > .env
-echo "OPENAI_API_KEY=<your-openai-api-key>" >> .env
-echo "OPENAI_MODEL=gpt-5.2" >> .env
-echo "ENABLE_WEB_SEARCH=true" >> .env
-```
+# Install dependencies
+uv sync --extra judge --extra participant --extra dev
 
-### Step 3: Prepare the output directory
-```bash
-mkdir -p output && chmod 777 output
-```
+# Configure
+cat > .env << 'EOF'
+LLM_PROVIDER=openai
+OPENAI_API_KEY=<your-key>
+OPENAI_MODEL=gpt-5.4
+ENABLE_WEB_SEARCH=false
+REASONING_EFFORT=medium
+RETRIEVAL_TOP_K=15
+CORPUS_DIR=/path/to/treasury_bulletins_parsed/transformed
+FAISS_INDEX_DIR=/path/to/faiss_index
+EOF
 
-### Step 4: Run the evaluation
-```bash
+# Generate compose and run
+set -a && source .env && set +a
+python generate_compose.py
 docker compose up --abort-on-container-exit --exit-code-from agentbeats-client
+
+# Check results
+python3 -c "import json; d=json.load(open('output/results.json'))['results'][0]; print(f\"{d['correct_answers']}/{d['total_questions']} ({d['accuracy']*100:.1f}%)\")"
 ```
 
-Results are saved to `output/results.json`:
-```bash
-cat output/results.json
-```
+## Leaderboard Submission
 
-Clean up when done:
-```bash
-docker compose down
-```
+The agent is deployed via [AgentBeats Quick Submit](https://agentbeats.dev/agentbeater/officeqa/submit):
 
-### Quick Test (1 Question)
+- **Docker image**: `ghcr.io/zaidishahbaz1/officeqa-agent:latest`
+- **Manifest**: `https://raw.githubusercontent.com/soumya-batra/officeqa_agentbeats/main/amber-manifest.json`
+- **Required secret**: `openai_api_key`
 
-To verify everything works before running the full 246-question evaluation:
+### Building the Production Image
 
-```bash
-sed -i 's/num_questions = 246/num_questions = 1/' a2a-scenario.toml
-docker compose up --abort-on-container-exit --exit-code-from agentbeats-client
-cat output/results.json
-docker compose down
-sed -i 's/num_questions = 1/num_questions = 246/' a2a-scenario.toml
-```
-
-### Full Evaluation (246 Questions)
-
-Once you've verified the quick test works, run the full evaluation:
+The production image bakes in the corpus and pre-built indexes for instant startup:
 
 ```bash
-sed -i 's/num_questions = 1/num_questions = 246/' a2a-scenario.toml
-docker compose up --abort-on-container-exit --exit-code-from agentbeats-client
+# Stage files
+cp -r /path/to/treasury_bulletins_parsed/transformed .docker-corpus
+mkdir -p .docker-faiss/openai
+cp faiss_index/openai/{index.faiss,chunks.json,bm25.pkl,year_index.json} .docker-faiss/openai/
+
+# Build and push (must be linux/amd64 for GitHub Actions runners)
+docker buildx build --platform linux/amd64 -f Dockerfile.officeqa-agent \
+  -t ghcr.io/zaidishahbaz1/officeqa-agent:latest --push .
+
+# Clean up
+rm -rf .docker-corpus .docker-faiss
 ```
-(Note that it is expected for this baseline purple agent, which is just an LLM configured with no tools, to perform poorly on this benchmark. We also test with additional configurations below, and will add true agentic purple agent systems on the leaderboard that will demonstrate accurate parsing, retrieval and reasoning capabilities.)
 
 ## Configuration
 
-### `.env` - Agent Environment Variables
-
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `LLM_PROVIDER` | LLM provider to use | `openai` |
+| `LLM_PROVIDER` | `openai`, `gemini`, or `anthropic` | `openai` |
 | `OPENAI_API_KEY` | OpenAI API key | - |
-| `OPENAI_MODEL` | OpenAI model name | `gpt-5.2` |
-| `ANTHROPIC_API_KEY` | Anthropic API key | - |
-| `ANTHROPIC_MODEL` | Anthropic model name | `claude-opus-4-5-20251101` |
-| `ENABLE_WEB_SEARCH` | Enable web search for document retrieval | `false` |
-| `REASONING_EFFORT` | Optional reasoning level for GPT-5 models | empty |
-| `CORPUS_DIR` | Local path to parsed Treasury Bulletin `.txt` files | empty |
-| `CPI_DATA_PATH` | Local path to CPI reference CSV for inflation questions | empty |
-| `RETRIEVAL_TOP_K` | Number of local corpus files to pass into the solver | `3` |
-
-### Baseline Configurations
-
-We provide 4 tested baseline configurations:
-
-#### GPT-5.2 with Web Search
-```bash
-cat > .env << 'EOF'
-LLM_PROVIDER=openai
-OPENAI_API_KEY=<your-openai-api-key>
-OPENAI_MODEL=gpt-5.2
-ENABLE_WEB_SEARCH=true
-EOF
-```
-
-#### GPT-5.2 without Tools
-```bash
-cat > .env << 'EOF'
-LLM_PROVIDER=openai
-OPENAI_API_KEY=<your-openai-api-key>
-OPENAI_MODEL=gpt-5.2
-ENABLE_WEB_SEARCH=false
-EOF
-```
-
-#### Claude Opus 4.5 with Web Search
-```bash
-cat > .env << 'EOF'
-LLM_PROVIDER=anthropic
-ANTHROPIC_API_KEY=<your-anthropic-api-key>
-ANTHROPIC_MODEL=claude-opus-4-5-20251101
-ENABLE_WEB_SEARCH=true
-EOF
-```
-
-#### Claude Opus 4.5 without Tools
-```bash
-cat > .env << 'EOF'
-LLM_PROVIDER=anthropic
-ANTHROPIC_API_KEY=<your-anthropic-api-key>
-ANTHROPIC_MODEL=claude-opus-4-5-20251101
-ENABLE_WEB_SEARCH=false
-EOF
-```
-
-### `a2a-scenario.toml` - Evaluation Parameters
-
-| Parameter | Description | Values |
-|-----------|-------------|--------|
-| `num_questions` | Number of questions to evaluate | 1-246 |
-| `difficulty` | Question difficulty filter | `"easy"`, `"hard"`, `"all"` |
-| `tolerance` | Numerical matching tolerance | 0.0 (exact) to 1.0 (loose) |
-
-### `scenario.toml` - Leaderboard / GitHub Actions
-
-Used by the GitHub Actions workflow and `generate_compose.py` for leaderboard submissions:
-
-```toml
-[green_agent]
-agentbeats_id = ""
-image = "ghcr.io/arnavsinghvi11/officeqa-judge:latest"
-
-[[participants]]
-agentbeats_id = ""
-name = "officeqa_agent"
-image = "ghcr.io/arnavsinghvi11/officeqa-agent:latest"
-env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
-
-[config]
-num_questions = 246
-difficulty = "all"
-tolerance = 0.0
-```
+| `OPENAI_MODEL` | Model name | `gpt-5.4` |
+| `REASONING_EFFORT` | Reasoning level for GPT-5 | `medium` |
+| `ENABLE_WEB_SEARCH` | Web search for external data | `false` |
+| `RETRIEVAL_TOP_K` | Number of chunks to retrieve | `15` |
+| `CORPUS_DIR` | Path to Treasury Bulletin `.txt` files | - |
+| `FAISS_INDEX_DIR` | Path to pre-built FAISS/BM25 indexes | - |
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Green Agent (Judge)                   │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │   server.py │  │  executor.py │  │   agent.py    │  │
-│  │  A2A Server │──│ Task Handler │──│ Orchestration │  │
-│  └─────────────┘  └──────────────┘  └───────────────┘  │
-│                                            │            │
-│                                            ▼            │
-│                                   ┌───────────────┐    │
-│                                   │ messenger.py  │    │
-│                                   │   A2A Client  │    │
-│                                   └───────────────┘    │
-└───────────────────────────────────────────┬─────────────┘
-                                            │
-                                            ▼ A2A Protocol
-┌─────────────────────────────────────────────────────────┐
-│                 Purple Agent (Participant)               │
-│  ┌─────────────┐  ┌──────────────┐                     │
-│  │   server.py │  │  executor.py │                     │
-│  │  A2A Server │──│  LLM Calls   │                     │
-│  └─────────────┘  └──────────────┘                     │
-└─────────────────────────────────────────────────────────┘
+Question
+  |
+  v
+[Planner] --> structured plan (data points, constraints, time periods)
+  |
+  v
+[Decomposer] --> 1-3 retrieval sub-queries
+  |
+  v
+[FAISS + BM25 Retriever] --> top-K relevant chunks from 150K corpus
+  |
+  v
+[GPT 5.4 + code_interpreter] --> reasoning + answer
+  |
+  v
+[Formatter] --> canonicalized final answer
 ```
 
-## Evaluation Protocol
-
-1. Judge loads questions from OfficeQA dataset
-2. For each question:
-   - Send question to purple agent, which is instructed to answer the question while 
-   returning its response with `<REASONING>` and `<FINAL_ANSWER>` tags for observability on its solution. 
-   - Receive answer (expecting `<FINAL_ANSWER>` tags)
-   - Score using fuzzy matching against ground truth
-3. Report aggregate results as artifacts
-
-### Scoring Criteria
-- **Numerical answers**: Fuzzy matching with unit awareness (million, billion, etc.)
-- **Text answers**: Case-insensitive exact match
-- **Hybrid answers**: Both text and number components must match
-
-
-## Submit Your Agent to Leaderboard
-
-To submit your agent for evaluation on the official leaderboard:
-
-1. Fork the [OfficeQA Leaderboard](https://github.com/arnavsinghvi11/officeqa-leaderboard)
-2. Edit `scenario.toml`:
-   - Set your agent's `agentbeats_id` under `[[participants]]`
-   - Configure your agent's Docker image and environment variables
-   - Add API keys to your fork's GitHub Secrets
-3. Push changes to trigger the GitHub Actions workflow
-4. Submit a PR with your results
-
-### Agent Requirements
-
-Your agent must:
-- Implement the A2A protocol
-- Accept questions about U.S. Treasury Bulletin documents
-- Return answers wrapped in `<FINAL_ANSWER></FINAL_ANSWER>` tags
-
-## Dataset Access
+## Dataset
 
 The [OfficeQA Dataset](https://github.com/databricks/officeqa) is publicly available:
-- **Questions**: https://github.com/databricks/officeqa/blob/main/officeqa.csv
-- **Source Documents**: https://github.com/databricks/officeqa/tree/main/treasury_bulletins_parsed
-- **Original PDFs**: https://github.com/databricks/officeqa/tree/main/treasury_bulletin_pdfs
-
-## Local Development
-
-For development and debugging without Docker:
-
-### Prerequisites
-- Python 3.11+
-- [uv](https://github.com/astral-sh/uv) package manager
-
-### Setup
-
-1. Clone and configure:
-```bash
-git clone https://github.com/arnavsinghvi11/officeqa_agentbeats.git
-cd officeqa_agentbeats
-cp sample.env .env
-```
-
-2. Install dependencies:
-```bash
-uv sync --extra judge --extra participant --extra dev
-```
-
-3. Run green agent scoring tests: `uv run --extra dev pytest judge/tests/ participant/tests/ -v`
-
-No `.env` file or API key is required for the unit tests above.
-
-4. Start each agent in separate terminals:
-```bash
-uv run python judge/src/server.py --host 127.0.0.1 --port 9009
-
-uv run python participant/src/server.py --host 127.0.0.1 --port 9019
-```
-
-For end-to-end runs that call the participant LLM, create a local `.env` first. Minimum OpenAI example:
-```bash
-cat > .env << 'EOF'
-LLM_PROVIDER=openai
-OPENAI_API_KEY=<your-openai-api-key>
-OPENAI_MODEL=gpt-5.2
-ENABLE_WEB_SEARCH=false
-CORPUS_DIR=/absolute/path/to/treasury_bulletins_parsed
-CPI_DATA_PATH=/absolute/path/to/cpi.csv
-EOF
-```
-
-### Building Images Locally
-
-```bash
-docker build -f Dockerfile.officeqa-judge -t ghcr.io/arnavsinghvi11/officeqa-judge:latest .
-docker build -f Dockerfile.officeqa-agent -t ghcr.io/arnavsinghvi11/officeqa-agent:latest .
-```
-
-## Resource Requirements
-- RAM: ~2GB minimum
-- CPU: 1+ cores
-- Network: Required for LLM API calls
+- **Questions**: [officeqa.csv](https://github.com/databricks/officeqa/blob/main/officeqa.csv) (246 questions)
+- **Source Documents**: [treasury_bulletins_parsed](https://github.com/databricks/officeqa/tree/main/treasury_bulletins_parsed) (698 bulletins, 1939-2025)
 
 ## License
 
