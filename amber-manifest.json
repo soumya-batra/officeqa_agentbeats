@@ -1,37 +1,33 @@
 {
-  "manifest_version": "0.1.0",
+  "manifest_version": "0.2.0",
+  "program": {
+    "image": "ghcr.io/zaidishahbaz1/officeqa-agent:latest",
+    "entrypoint": ["python", "-m", "src.server", "--host", "0.0.0.0", "--port", "8080"],
+    "env": {
+      "OPENAI_API_KEY": "${config.openai_api_key}",
+      "OPENAI_MODEL": { "when": "config.openai_model", "value": "${config.openai_model}" },
+      "REASONING_EFFORT": { "when": "config.reasoning_effort", "value": "${config.reasoning_effort}" },
+      "PYTHONUNBUFFERED": "1",
+      "LOG_LEVEL": "INFO"
+    },
+    "network": {
+      "endpoints": [{ "name": "endpoint", "port": 8080 }]
+    }
+  },
   "config_schema": {
     "type": "object",
     "properties": {
-      "openai_api_key": { "type": "string", "secret": true }
+      "openai_api_key": { "type": "string", "secret": true },
+      "openai_model": { "type": "string" },
+      "reasoning_effort": { "type": "string" }
     },
     "required": ["openai_api_key"],
     "additionalProperties": false
   },
-  "program": {
-    "image": "ghcr.io/zaidishahbaz1/officeqa-agent:latest",
-    "entrypoint": ["python", "server.py", "--host", "0.0.0.0", "--port", "9019"],
-    "env": {
-      "PYTHONUNBUFFERED": "1",
-      "OPENAI_API_KEY": "${config.openai_api_key}",
-      "LLM_PROVIDER": "openai",
-      "OPENAI_MODEL": "gpt-5.4",
-      "ENABLE_WEB_SEARCH": "true",
-      "REASONING_EFFORT": "high",
-      "CORPUS_DIR": "/app/corpus/transformed",
-      "FAISS_INDEX_DIR": "/app/faiss_index"
-    },
-    "network": {
-      "endpoints": [{ "name": "a2a_endpoint", "port": 9019 }]
-    }
-  },
   "provides": {
-    "a2a": { "kind": "a2a", "endpoint": "a2a_endpoint" }
+    "a2a": { "kind": "a2a", "endpoint": "endpoint" }
   },
   "exports": {
     "a2a": "a2a"
-  },
-  "metadata": {
-    "agentbeats_id": "019d7202-fad7-71f0-9a15-62bb3faa4104"
   }
 }
