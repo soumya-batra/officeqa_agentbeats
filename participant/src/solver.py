@@ -38,50 +38,22 @@ Output JSON (no markdown fences):
   "queries": ["<query 1>", "<query 2 if needed>"]
 }"""
 
-SYSTEM_PROMPT = """You are answering questions about U.S. Treasury Bulletin documents using retrieved context.
+SYSTEM_PROMPT = """You answer questions about U.S. Treasury Bulletin documents using retrieved context.
 
-## CRITICAL: use python code for ALL data extraction AND calculations
-- ALWAYS use the python tool (code_execution) for EVERYTHING:
-  1. PARSING TABLES: Write Python code to parse the table text from the context. Extract values by matching row labels and column headers programmatically. NEVER eyeball or manually read numbers from tables.
-  2. ALL ARITHMETIC: ratios, percentages, sums, differences, averages, growth rates, rounding.
-- NEVER read a number from a table by eye — always write code that finds the row and column and extracts the value.
-- Show the final computed answer clearly in the code output.
+Rules:
+- Use code_execution for ALL table parsing and arithmetic. Never eyeball numbers from tables.
+- Extract figures from the retrieved context. Use web search only for external data (CPI, exchange rates).
+- Fiscal year (pre-1977): July 1 – June 30. Calendar year: Jan 1 – Dec 31.
+- Preserve full precision; round only at the final step if instructed.
+- Match exact table name, row label, and column. Do not substitute similar categories.
+- Page number questions: report the physical page number (small integer), not section codes.
 
-## Table parsing strategy
-The retrieved context contains text-formatted tables. To extract values:
-1. Split the table text into lines
-2. Identify the header row (contains column names like years or months)
-3. Find the target row by matching the row label from the question
-4. Extract the value at the correct column position
-5. Handle separators like "|" or multiple spaces between columns
-This approach avoids misreading adjacent rows or columns.
-
-## Source priority
-1. Always extract figures directly from the retrieved Treasury Bulletin context.
-2. Use web search only for external data explicitly required by the question (e.g. CPI indices, exchange rates, inflation adjusters).
-3. Never rely on memorized values — always verify against the source documents.
-
-## Calendar year vs fiscal year
-- Fiscal year (pre-1977): July 1 through June 30 (e.g. FY1940 = July 1939 – June 1940).
-- Calendar year: January 1 through December 31 of that year.
-
-## Precision
-- Preserve full numerical precision throughout; only round at the final step as instructed.
-- Pay close attention to the exact table name, row label, and column in the question.
-- Do NOT substitute a similar-sounding category or adjacent row.
-
-## Page number questions
-- When asked for the page number containing certain data, report the page number printed on the physical page (typically a small number 1-100), NOT bulletin section codes like "B-462-B" or index numbers.
-- Page numbers appear at the top or bottom of each page as simple integers.
-
-## Answer format
-Do all your reasoning in your thinking. Keep your visible output SHORT.
-Return ONLY this:
+Output format (keep visible output SHORT):
 <REASONING>
-[1-2 sentence summary of your approach and the key data extracted]
+[1-2 sentence summary]
 </REASONING>
 <FINAL_ANSWER>
-[canonical answer only: a single number or value, no units, no prose, no markdown, no explanation]
+[bare number or value only — no units, no prose, no markdown]
 </FINAL_ANSWER>
 """
 
@@ -107,62 +79,6 @@ Rules:
 - Keep data_points specific: not "some value" but "total interest-bearing U.S. public debt September 1989"
 - extra_queries should target data the main question text wouldn't directly match in search"""
 
-VERIFIER_SYSTEM_PROMPT = """You are an answer auditor for U.S. Treasury Bulletin questions.
-
-You will receive:
-1. The original question
-2. A structured plan (constraints, required data points, expected answer type)
-3. The solver's reasoning and proposed answer
-
-Your job: check ONLY for clear structural violations. You do NOT have access to the source data, so you CANNOT verify whether specific numbers are correct.
-
-ONLY flag these specific error types:
-- CONSTRAINT VIOLATION: The solver explicitly added something the question said to EXCLUDE, or omitted something it said to INCLUDE. The violation must be obvious from the solver's own reasoning (e.g., "I added revolving funds" when the question says "exclude revolving funds").
-- FORMAT ERROR: The answer is a section code (like "B-462-B") when the question asks for a page number, or the answer includes prose when it should be a bare number.
-
-DO NOT flag:
-- Whether specific dollar amounts, percentages, or values are correct (you can't verify this)
-- Whether the solver used the right table or right row (you can't verify this)
-- Data interpretation disagreements
-- Anything you're uncertain about
-
-Output JSON (no markdown fences):
-{
-  "verdict": "PASS" or "FAIL",
-  "issues": ["<issue 1 if FAIL>"],
-  "correction_hint": "<specific guidance for how to fix the answer, if FAIL>"
-}
-
-When in doubt, ALWAYS output PASS. Only FAIL on unambiguous constraint violations visible in the reasoning."""
-
-REFINE_QUERY_PROMPT = """A question about U.S. Treasury Bulletins could not be fully answered because some data was missing from the retrieved context.
-
-Question: {question}
-
-Model's reasoning (showing what it looked for but could not find):
-{reasoning}
-
-Based on what specific data was missing, generate a focused retrieval query (10-20 words) to locate that data in the Treasury Bulletin corpus.  Focus on the exact table name, year, row label, or metric that was unavailable.
-
-Output JSON (no markdown fences):
-{{"query": "<your focused query>"}}"""
-
-# Patterns that indicate the model could not find what it needed.
-_LOW_CONFIDENCE_PATTERNS = [
-    "n/a",
-    "unable to determine",
-    "cannot find",
-    "not enough information",
-    "no data",
-    "not available",
-    "insufficient",
-    "does not include",
-    "not present in",
-    "cannot be determined",
-    "could not locate",
-    "no relevant",
-    "not provided",
-]
 
 _PAGE_NUMBER_RE = re.compile(
     r"\b(?:page\s*number|what\s+(?:is\s+)?(?:the\s+)?page|which\s+page)\b", re.I
@@ -267,41 +183,6 @@ class OfficeQASolver:
             raw_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=prompt)
             reasoning, final_answer = ensure_structured_response(raw_response)
 
-            # ── Agent 3b: RETRY on low-confidence ──
-            if self._is_low_confidence(final_answer, reasoning):
-                logger.info("Low-confidence answer detected, retrying with refined retrieval")
-                try:
-                    refined_query = self._get_refined_query(core_question, reasoning)
-                    extra_contexts = self._collect_single_query_contexts(refined_query, source_hints)
-                    merged = self._merge_contexts(contexts, extra_contexts)
-                    retry_prompt = self._build_retry_prompt(core_question, merged, reasoning)
-                    raw_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=retry_prompt)
-                    reasoning, final_answer = ensure_structured_response(raw_response)
-                    contexts = merged
-                except Exception as exc:
-                    logger.warning("Retry failed, keeping original answer: %s", exc)
-
-            # ── Agent 4: VERIFIER ──────
-            verification = {}
-            verification = self._verify_answer(core_question, plan, reasoning, final_answer)
-            if verification.get("verdict") == "FAIL":
-                logger.info("Verifier FAILED: %s", verification.get("issues"))
-                correction_hint = verification.get("correction_hint", "")
-                try:
-                    correction_prompt = self._build_correction_prompt(
-                        core_question, contexts, reasoning, final_answer, correction_hint, plan,
-                    )
-                    corrected_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=correction_prompt)
-                    corrected_reasoning, corrected_answer = ensure_structured_response(corrected_response)
-                    if not self._is_low_confidence(corrected_answer, corrected_reasoning):
-                        raw_response = corrected_response
-                        reasoning = corrected_reasoning
-                        final_answer = corrected_answer
-                    else:
-                        logger.info("Correction produced low-confidence answer, keeping original")
-                except Exception as exc:
-                    logger.warning("Correction failed, keeping original answer: %s", exc)
-
             # ── Post-process ─────────────────────────────────────────
             final_answer = canonicalize_final_answer(question, final_answer)
 
@@ -316,7 +197,6 @@ class OfficeQASolver:
                 {
                     **base_debug_payload,
                     "route": "model",
-                    "verification": verification,
                     "final_answer": final_answer,
                     "reasoning": reasoning,
                     "raw_response": raw_response,
@@ -512,32 +392,6 @@ class OfficeQASolver:
                 deduped[key] = ctx
         return sorted(deduped.values(), key=lambda c: c.score, reverse=True)
 
-    # ------------------------------------------------------------------
-    # Confidence check & agentic retry
-    # ------------------------------------------------------------------
-
-    def _is_low_confidence(self, answer: str, reasoning: str) -> bool:
-        # With concise reasoning (1-2 sentences), the summary often mentions
-        # missing data even when a valid answer was found.  Only check the
-        # final answer itself to avoid false-positive retries.
-        answer_lower = answer.lower().strip()
-        return any(p in answer_lower for p in _LOW_CONFIDENCE_PATTERNS)
-
-    def _get_refined_query(self, question: str, reasoning: str) -> str:
-        """Ask the cheap model what to search for based on the failed reasoning."""
-        try:
-            raw = self._llm_client.complete_cheap(
-                system_prompt="You generate focused document-retrieval queries. Output JSON only.",
-                prompt=REFINE_QUERY_PROMPT.format(question=question, reasoning=reasoning[:2000]),
-            )
-            parsed = _parse_json_robust(raw)
-            refined = (parsed.get("query") or "").strip()
-            if refined:
-                print(f"[RETRY] refined query: {refined}")
-                return refined
-        except Exception as exc:
-            logger.warning("Refine query failed: %s", exc)
-        return question
 
     # ------------------------------------------------------------------
     # Table reformatting (make tables LLM-readable)
@@ -586,90 +440,10 @@ class OfficeQASolver:
 
         return "\n".join(lines) if lines else ""
 
-    # ------------------------------------------------------------------
-    # Agent 4: Verifier
-    # ------------------------------------------------------------------
-
-    def _verify_answer(self, question: str, plan: dict, reasoning: str, answer: str) -> dict:
-        """Use a cheap model to audit the answer against the question and plan."""
-        try:
-            prompt = (
-                f"QUESTION:\n{question}\n\n"
-                f"PLAN:\n{json.dumps(plan, indent=2)}\n\n"
-                f"SOLVER REASONING:\n{reasoning[:3000]}\n\n"
-                f"PROPOSED ANSWER:\n{answer}"
-            )
-            raw = self._llm_client.complete_cheap(
-                system_prompt=VERIFIER_SYSTEM_PROMPT,
-                prompt=prompt,
-            )
-            result = _parse_json_robust(raw)
-            verdict = result.get("verdict", "PASS")
-            print(f"[VERIFY] verdict={verdict} issues={result.get('issues', [])}")
-            return result
-        except Exception as exc:
-            logger.warning("Verifier failed: %s", exc)
-            return {"verdict": "PASS"}
 
     # ------------------------------------------------------------------
     # Prompt builders
     # ------------------------------------------------------------------
-
-    def _build_correction_prompt(
-        self,
-        question: str,
-        contexts: list[RetrievedContext],
-        prior_reasoning: str,
-        prior_answer: str,
-        correction_hint: str,
-        plan: dict,
-    ) -> str:
-        """Build a prompt for the correction pass after verifier found issues."""
-        constraints_text = ""
-        if plan.get("constraints"):
-            constraints_text = "\n".join(f"- {c}" for c in plan["constraints"])
-
-        lines = [
-            "A previous answer to this question was flagged by a verifier as potentially incorrect.",
-            "",
-            "VERIFIER FEEDBACK:",
-            correction_hint,
-            "",
-        ]
-        if constraints_text:
-            lines.extend([
-                "QUESTION CONSTRAINTS (from analysis):",
-                constraints_text,
-                "",
-            ])
-        lines.extend([
-            "Previous reasoning (may contain errors):",
-            prior_reasoning[:2000],
-            "",
-            f"Previous answer (flagged): {prior_answer}",
-            "",
-            "INSTRUCTIONS:",
-            "- Re-read the question carefully, paying close attention to the verifier feedback.",
-            "- Re-examine the retrieved context and correct any errors.",
-            "- Follow all constraints identified above.",
-            "",
-            "FINAL_ANSWER rules:",
-            "- If the answer is a single scalar, output only that scalar.",
-            "- Do not add prose, bullets, markdown, or explanations inside FINAL_ANSWER.",
-            "- Use square brackets only if the question explicitly asks for a bracketed list.",
-            "",
-            "Question:",
-            question,
-        ])
-        if contexts:
-            lines.extend(["", "Retrieved context:"])
-            for index, context in enumerate(contexts, start=1):
-                lines.extend([
-                    f"[Source {index}] {context.source} (score={context.score:.1f})",
-                    context.content,
-                    "",
-                ])
-        return "\n".join(lines).strip()
 
     def _build_prompt(self, question: str, contexts: list[RetrievedContext], is_page_question: bool = False, table_data: str = "", plan: dict | None = None) -> str:
         lines = [
@@ -723,34 +497,6 @@ class OfficeQASolver:
             ])
         return "\n".join(lines).strip()
 
-    def _build_retry_prompt(
-        self, question: str, contexts: list[RetrievedContext], prior_reasoning: str
-    ) -> str:
-        lines = [
-            "A previous attempt to answer this question failed because some data was missing.",
-            "Additional context has now been retrieved. Use ALL provided context to answer.",
-            "",
-            "Previous reasoning (for reference — the answer was incomplete/wrong):",
-            prior_reasoning[:3000],
-            "",
-            "FINAL_ANSWER rules:",
-            "- If the answer is a single scalar, output only that scalar.",
-            "- Do not add prose, bullets, markdown, or explanations inside FINAL_ANSWER.",
-            "- Use square brackets only if the question explicitly asks for a bracketed list.",
-            "",
-            "Question:",
-            question,
-        ]
-        if contexts:
-            lines.extend(["", "Retrieved context:"])
-            for index, context in enumerate(contexts, start=1):
-                lines.extend([
-                    f"[Source {index}] {context.source} (score={context.score:.1f})",
-                    context.content,
-                    "",
-                ])
-        return "\n".join(lines).strip()
-
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
@@ -789,11 +535,7 @@ class OfficeQASolver:
 
     @staticmethod
     def _log_chunks(contexts: list[RetrievedContext]) -> None:
-        print("\n" + "=" * 80)
-        print(f"RETRIEVED CHUNKS ({len(contexts)} total):")
-        print("-" * 80)
-        for i, ctx in enumerate(contexts, start=1):
-            print(f"[Chunk {i}] source={ctx.source}  score={ctx.score:.2f}")
-            print(ctx.content[:500])
-            print("-" * 40)
-        print("=" * 80 + "\n")
+        print(f"\n[RETRIEVAL] {len(contexts)} chunks retrieved")
+        for i, ctx in enumerate(contexts[:5], start=1):
+            print(f"  [{i}] {ctx.source} (score={ctx.score:.2f}) {ctx.content[:100]}...")
+

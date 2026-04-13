@@ -69,8 +69,14 @@ class FaissRetriever:
 
         if index_path.exists() and meta_path.exists():
             self._load(index_path, meta_path)
-        elif any_meta and not meta_path.exists():
-            # Reuse chunks from another provider's index for BM25, skip FAISS build
+        elif meta_path.exists():
+            # chunks.json exists but no FAISS index — BM25-only mode
+            logger.info("No FAISS index, loading chunks from %s for BM25-only retrieval", meta_path)
+            with meta_path.open("r", encoding="utf-8") as f:
+                self._chunks = json.load(f)
+            logger.info("Loaded %d chunks (BM25-only mode, no FAISS semantic search)", len(self._chunks))
+        elif any_meta:
+            # Reuse chunks from another provider's index for BM25
             logger.info("No FAISS index for %s, loading chunks from %s for BM25-only retrieval",
                         self._embedding_provider, any_meta)
             with any_meta.open("r", encoding="utf-8") as f:

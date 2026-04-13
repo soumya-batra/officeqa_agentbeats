@@ -51,7 +51,7 @@ class SolverConfig:
                 parsed_json_dir = candidate
         return cls(
             llm_provider=os.environ.get("LLM_PROVIDER", "").lower(),
-            openai_model=os.environ.get("OPENAI_MODEL", "gpt-5.2"),
+            openai_model=os.environ.get("OPENAI_MODEL", "gpt-5.4"),
             anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-5-20251101"),
             anthropic_max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000")),
             gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview"),
