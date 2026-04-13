@@ -3,20 +3,20 @@
   "config_schema": {
     "type": "object",
     "properties": {
-      "google_api_key": { "type": "string", "secret": true }
+      "openai_api_key": { "type": "string", "secret": true }
     },
-    "required": ["google_api_key"],
+    "required": ["openai_api_key"],
     "additionalProperties": false
   },
   "program": {
-    "image": "ghcr.io/soumya-batra/officeqa-agent:latest",
+    "image": "ghcr.io/zaidishahbaz1/officeqa-agent:latest",
     "entrypoint": ["python", "server.py", "--host", "0.0.0.0", "--port", "9019"],
     "env": {
       "PYTHONUNBUFFERED": "1",
-      "GOOGLE_API_KEY": "${config.google_api_key}",
-      "LLM_PROVIDER": "gemini",
-      "GEMINI_MODEL": "gemini-3-flash-preview",
-      "ENABLE_WEB_SEARCH": "true",
+      "OPENAI_API_KEY": "${config.openai_api_key}",
+      "LLM_PROVIDER": "openai",
+      "OPENAI_MODEL": "gpt-5.4",
+      "ENABLE_WEB_SEARCH": "false",
       "REASONING_EFFORT": "medium",
       "CORPUS_DIR": "/app/corpus/transformed",
       "FAISS_INDEX_DIR": "/app/faiss_index"
