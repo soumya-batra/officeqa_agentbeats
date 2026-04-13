@@ -69,7 +69,7 @@ def build_compose(scenario: dict) -> dict:
         participant_env = participant.get("env", {})
         resolved_env = resolve_env(participant_env)
         volumes = [f"./{OUTPUT_DIR}:/app/output"]
-        for env_key in ("CORPUS_DIR", "CPI_DATA_PATH"):
+        for env_key in ("CORPUS_DIR", "CPI_DATA_PATH", "FAISS_INDEX_DIR"):
             mounted_path = resolved_env.get(env_key)
             if mounted_path:
                 volumes.append(f"{mounted_path}:{mounted_path}:ro")

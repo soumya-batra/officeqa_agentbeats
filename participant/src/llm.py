@@ -151,15 +151,7 @@ class LLMClient:
                 kwargs["reasoning"] = {"effort": self._config.reasoning_effort}
             else:
                 kwargs["temperature"] = 0
-            print("\n" + "="*80)
-            print("SYSTEM PROMPT (instructions):")
-            print("-"*80)
-            print(system_prompt)
-            print("="*80)
-            print("USER PROMPT (input):")
-            print("-"*80)
-            print(prompt)
-            print("="*80 + "\n")
+            print(f"\n[LLM] model={model} prompt_len={len(prompt)} chars")
             response = client.responses.create(**kwargs)
             return response.output_text or ""
 
