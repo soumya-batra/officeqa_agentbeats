@@ -3,9 +3,11 @@
   "config_schema": {
     "type": "object",
     "properties": {
-      "google_api_key": { "type": "string", "secret": true }
+      "nebius_api_key": { "type": "string", "secret": true },
+      "nebius_model": { "type": "string", "default": "moonshotai/Kimi-K2.5-fast" },
+      "nebius_base_url": { "type": "string", "default": "https://api.studio.nebius.com/v1/" }
     },
-    "required": ["google_api_key"],
+    "required": ["nebius_api_key"],
     "additionalProperties": false
   },
   "program": {
@@ -13,11 +15,12 @@
     "entrypoint": ["python", "server.py", "--host", "0.0.0.0", "--port", "9019"],
     "env": {
       "PYTHONUNBUFFERED": "1",
-      "GOOGLE_API_KEY": "${config.google_api_key}",
-      "LLM_PROVIDER": "gemini",
-      "GEMINI_MODEL": "gemini-3-flash-preview",
-      "ENABLE_WEB_SEARCH": "true",
-      "REASONING_EFFORT": "medium",
+      "LLM_PROVIDER": "nebius",
+      "NEBIUS_API_KEY": "${config.nebius_api_key}",
+      "NEBIUS_MODEL": "${config.nebius_model}",
+      "NEBIUS_BASE_URL": "${config.nebius_base_url}",
+      "ENABLE_WEB_SEARCH": "false",
+      "RETRIEVAL_TOP_K": "8",
       "CORPUS_DIR": "/app/corpus/transformed",
       "FAISS_INDEX_DIR": "/app/faiss_index"
     },
