@@ -5,9 +5,10 @@
     "properties": {
       "nebius_api_key": { "type": "string", "secret": true },
       "nebius_model": { "type": "string", "default": "moonshotai/Kimi-K2.5-fast" },
-      "nebius_base_url": { "type": "string", "default": "https://api.studio.nebius.com/v1/" }
+      "nebius_base_url": { "type": "string", "default": "https://api.studio.nebius.com/v1/" },
+      "tavily_api_key": { "type": "string", "secret": true }
     },
-    "required": ["nebius_api_key"],
+    "required": ["nebius_api_key", "tavily_api_key"],
     "additionalProperties": false
   },
   "program": {
@@ -19,7 +20,7 @@
       "NEBIUS_API_KEY": "${config.nebius_api_key}",
       "NEBIUS_MODEL": "${config.nebius_model}",
       "NEBIUS_BASE_URL": "${config.nebius_base_url}",
-      "ENABLE_WEB_SEARCH": "false",
+      "TAVILY_API_KEY": "${config.tavily_api_key}",
       "RETRIEVAL_TOP_K": "8",
       "CORPUS_DIR": "/app/corpus/transformed",
       "FAISS_INDEX_DIR": "/app/faiss_index"
