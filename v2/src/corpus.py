@@ -19,8 +19,8 @@ CORPUS_URL_DEFAULT = (
     "treasury_bulletins_parsed/transformed/treasury_bulletins_transformed.zip"
 )
 
-CHUNK_CHARS = 1800
-CHUNK_OVERLAP = 300
+CHUNK_CHARS = 3000
+CHUNK_OVERLAP = 400
 
 FILENAME_RE = re.compile(r"treasury_bulletin_(\d{4})_(\d{2})\.txt$", re.IGNORECASE)
 

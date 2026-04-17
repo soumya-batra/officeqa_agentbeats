@@ -1,10 +1,13 @@
-"""OfficeQA agent: extract years → BM25 retrieve → single GPT 5.4 call."""
+"""OfficeQA agent: analyze → BM25 retrieve → single GPT call."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
+from typing import Any
 
 from openai import OpenAI
 
@@ -12,12 +15,20 @@ from .corpus import Corpus, Chunk
 
 logger = logging.getLogger(__name__)
 
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "medium")
 TOP_K = int(os.environ.get("TOP_K", "22"))
-MAX_CHARS_PER_CHUNK = int(os.environ.get("MAX_CHARS_PER_CHUNK", "1800"))
+MAX_CHARS_PER_CHUNK = int(os.environ.get("MAX_CHARS_PER_CHUNK", "2500"))
 
-SYSTEM_PROMPT = """You are an analyst answering questions about U.S. Treasury Bulletins (1939-2025).
+ANALYZE_SYSTEM = """You convert a U.S. Treasury Bulletin question into a retrieval plan.
+Do NOT answer the question. Just plan retrieval.
+
+Return a compact JSON object with keys:
+  "years": list[int] — all years the question depends on (include ±1 for fiscal years)
+  "query": string — keyword-rich search query, ~20-40 words, table headers, metric names, dates
+Return ONLY JSON, no prose, no markdown fence."""
+
+ANSWER_SYSTEM = """You are an analyst answering questions about U.S. Treasury Bulletins (1939-2025).
 You are given retrieved excerpts containing the ground truth — prefer them over prior knowledge.
 
 PRECISION RULES:
@@ -26,7 +37,7 @@ PRECISION RULES:
 - For PERCENT answers: if excerpt shows "0.1234" and question asks for percent, multiply by 100.
 - Fiscal year: FY N = July 1 of N-1 to June 30 of N (pre-1977), Oct 1 of N-1 to Sep 30 of N (after).
 - For LIST answers: emit values comma-separated in square brackets.
-- Preserve the sign of computed values. Keep negative sign if the result is negative.
+- Preserve the sign of computed values. Keep negative sign if result is negative.
 - Use code_interpreter for ALL arithmetic: sums, percentages, regressions, rounding.
 
 FORMATTING RULES:
@@ -42,6 +53,7 @@ You MUST always end with both tags:
 [bare number or value only]
 </FINAL_ANSWER>"""
 
+_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
 _REASONING_RE = re.compile(r"<REASONING>\s*(.*?)\s*</REASONING>", re.DOTALL | re.IGNORECASE)
 _FINAL_RE = re.compile(r"<FINAL_ANSWER>\s*(.*?)\s*</FINAL_ANSWER>", re.DOTALL | re.IGNORECASE)
@@ -55,6 +67,16 @@ def _years_in(text: str) -> list[int]:
     for y in years:
         widened.update({y - 1, y + 1})
     return sorted(widened)
+
+
+def _extract_json(text: str) -> dict[str, Any] | None:
+    m = _JSON_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
 
 
 def _format_chunks(chunks: list[Chunk]) -> str:
@@ -121,40 +143,73 @@ class OfficeQAAgent:
         self.corpus = corpus
         self.client = client or OpenAI()
 
-    def answer_question(self, question: str) -> AgentResult:
-        # 1. Extract years directly from question text (no LLM call)
+    def _analyze(self, question: str) -> tuple[list[int], str]:
+        """Fast LLM call to extract years and generate a better search query."""
+        # Always extract years from text as baseline
         years = _years_in(question)
-        logger.info("Years: %s", years)
-
-        # 2. BM25 retrieve (no LLM call)
-        hits = self.corpus.search(question, top_k=TOP_K, year_filter=years or None)
-        chunks = [c for c, _ in hits]
-        logger.info("Retrieved %d chunks", len(chunks))
-
-        # 3. Single GPT 5.4 call with code_interpreter
-        context = _format_chunks(chunks)
-        user_prompt = (
-            f"QUESTION:\n{question}\n\n"
-            f"RETRIEVED EXCERPTS ({len(chunks)}):\n{context}\n"
-        )
+        query = question
 
         try:
+            t0 = time.time()
+            resp = self.client.responses.create(
+                model=MODEL,
+                instructions=ANALYZE_SYSTEM,
+                input=[{"role": "user", "content": question}],
+                reasoning={"effort": "low"},
+            )
+            raw = resp.output_text or ""
+            logger.info("Analyze LLM: %.1fs", time.time() - t0)
+
+            plan = _extract_json(raw)
+            if plan:
+                if plan.get("years"):
+                    extra_years = set(plan["years"])
+                    for y in list(extra_years):
+                        extra_years.update({y - 1, y + 1})
+                    years = sorted(set(years) | extra_years)
+                if plan.get("query"):
+                    query = plan["query"]
+        except Exception as e:
+            logger.warning("Analyze failed, using regex years: %s", e)
+
+        return years, query
+
+    def answer_question(self, question: str) -> AgentResult:
+        # 1. Analyze: fast LLM call for better years + query
+        years, query = self._analyze(question)
+        logger.info("Years: %s, Query: %.80s", years, query)
+
+        # 2. BM25 retrieve
+        t0 = time.time()
+        hits = self.corpus.search(query, top_k=TOP_K, year_filter=years or None)
+        chunks = [c for c, _ in hits]
+        logger.info("Retrieved %d chunks in %.1fs", len(chunks), time.time() - t0)
+
+        # 3. Single GPT call with code_interpreter
+        context = _format_chunks(chunks)
+        user_prompt = f"QUESTION:\n{question}\n\nRETRIEVED EXCERPTS ({len(chunks)}):\n{context}\n"
+
+        try:
+            t0 = time.time()
             tools = [{"type": "code_interpreter", "container": {"type": "auto"}}]
             resp = self.client.responses.create(
                 model=MODEL,
-                instructions=SYSTEM_PROMPT,
+                instructions=ANSWER_SYSTEM,
                 input=[{"role": "user", "content": user_prompt}],
                 reasoning={"effort": REASONING_EFFORT},
                 tools=tools,
             )
             raw = resp.output_text or ""
+            logger.info("Answer LLM: %.1fs, len=%d", time.time() - t0, len(raw))
         except Exception as e:
-            logger.exception("OpenAI API call failed: %s", e)
+            logger.exception("OpenAI API failed: %s", e)
             raw = f"<REASONING>API error: {e}</REASONING>\n<FINAL_ANSWER>0</FINAL_ANSWER>"
 
         normalized = _normalize_response(raw)
         r = _REASONING_RE.search(normalized)
         f = _FINAL_RE.search(normalized)
+
+        logger.info("Final answer: %s", f.group(1).strip()[:100] if f else "NONE")
 
         return AgentResult(
             reasoning=r.group(1).strip() if r else "",
