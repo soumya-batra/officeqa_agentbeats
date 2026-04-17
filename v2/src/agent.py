@@ -39,15 +39,25 @@ PRECISION RULES:
 - Fiscal year: FY N = July 1 of N-1 to June 30 of N (pre-1977), Oct 1 of N-1 to Sep 30 of N (after).
 - For LIST answers: emit values comma-separated in square brackets with a space after each comma, e.g. [0.096, -184.143].
 
-SIGN RULES (CRITICAL — read carefully):
+ROUNDING RULES (CRITICAL):
+- If the question says "rounded to N decimal places" or "to the nearest thousandth/hundredth", you MUST round to exactly N decimal places. E.g. "rounded to 2 decimal places" → output 1.67, not 1.667857.
+- If the question says "rounded to the nearest integer/whole number", round to 0 decimal places.
+- If no rounding is specified, preserve full precision from the source.
+
+SIGN RULES (CRITICAL):
 - When computing a CHANGE (B − A), DIFFERENCE, or GROWTH RATE, keep the negative sign if B < A.
 - When the question says "by how much did X decrease", the answer should be NEGATIVE if it decreased.
 - NEVER drop a negative sign. If your computation gives -118255.5, output -118255.5, not 118255.5.
 - Double-check: does your sign match the direction described in the question?
 
+PERCENT RULES:
+- If the question asks for a percentage or percent value, include the % sign in your answer.
+- If the question says "as a percentage" or "expressed as percent", include %.
+- If the question says "as a decimal", do NOT include %.
+
 FORMATTING RULES:
 - Emit exactly one value (or one list). Multiple candidate numbers will AUTO-FAIL.
-- No units suffix. Use bare number.
+- No units suffix (no "million", "dollars") unless the answer is a text string. Use bare number.
 - Never output "no answer found" — give your best numeric guess.
 - Write Python code (using print()) for ALL arithmetic. Show final value clearly.
 
