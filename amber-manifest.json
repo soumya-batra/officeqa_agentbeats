@@ -7,6 +7,7 @@
       "OPENAI_API_KEY": "${config.openai_api_key}",
       "OPENAI_MODEL": { "when": "config.openai_model", "value": "${config.openai_model}" },
       "REASONING_EFFORT": { "when": "config.reasoning_effort", "value": "${config.reasoning_effort}" },
+      "ENABLE_WEB_SEARCH": "true",
       "PYTHONUNBUFFERED": "1",
       "LOG_LEVEL": "INFO"
     },
