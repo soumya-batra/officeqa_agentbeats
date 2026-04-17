@@ -47,13 +47,8 @@ A purple agent submission for the [OfficeQA AgentBeats benchmark](https://agentb
 - **Web search** via Tavily API for external facts (historical dates, exchange rates) not in the corpus
 - **Kimi native tool-call parsing**: Handles Kimi's non-standard `<|tool_call_begin|>` markup when it doesn't populate the OpenAI-standard `tool_calls` field
 - Up to 5 tool-call round-trips per question, with empty-response retry logic (2 retries)
-
-### Answer Post-Processing (`formatting.py`)
-- **Sign preservation**: Negative lookahead regex in `_candidate_lines` prevents stripping leading minus signs from negative numbers (e.g., `-0.356`, `-75`)
-- **List detection and formatting**: Recognizes when questions expect bracketed list answers (`[a, b, c]`) and extracts/normalizes numeric tokens accordingly
-- **Scalar candidate selection**: Prioritizes lines containing keywords like "final", "therefore", "answer" when extracting the numeric answer from model output
-- **Percent handling**: Detects whether the question expects a `%` sign and normalizes accordingly
 - **Fallback extraction**: When the model omits `<FINAL_ANSWER>` tags, regex-based extraction finds the answer from phrases like "the answer is..." or the last number in the response
+
 
 ### Robustness
 - **Retry logic**: Retries only on Nebius 429 (rate limit) and 400 (connection error) with exponential backoff (3s, 8s). Never retries 504 timeouts or context-length blowouts
