@@ -1,4 +1,4 @@
-"""OfficeQA agent: analyze → BM25 retrieve → single GPT call."""
+"""OfficeQA agent: analyze → BM25 retrieve → answer → optional refine."""
 from __future__ import annotations
 
 import json
@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "medium")
 TOP_K = int(os.environ.get("TOP_K", "22"))
+TOP_K_REFINE = int(os.environ.get("TOP_K_REFINE", "18"))
 MAX_CHARS_PER_CHUNK = int(os.environ.get("MAX_CHARS_PER_CHUNK", "2500"))
 
 ANALYZE_SYSTEM = """You convert a U.S. Treasury Bulletin question into a retrieval plan.
@@ -36,14 +37,19 @@ PRECISION RULES:
 - If the question asks "in millions" and the excerpt says "in thousands", divide by 1000.
 - For PERCENT answers: if excerpt shows "0.1234" and question asks for percent, multiply by 100.
 - Fiscal year: FY N = July 1 of N-1 to June 30 of N (pre-1977), Oct 1 of N-1 to Sep 30 of N (after).
-- For LIST answers: emit values comma-separated in square brackets.
-- Preserve the sign of computed values. Keep negative sign if result is negative.
-- Use code_interpreter for ALL arithmetic: sums, percentages, regressions, rounding.
+- For LIST answers: emit values comma-separated in square brackets with a space after each comma, e.g. [0.096, -184.143].
+
+SIGN RULES (CRITICAL — read carefully):
+- When computing a CHANGE (B − A), DIFFERENCE, or GROWTH RATE, keep the negative sign if B < A.
+- When the question says "by how much did X decrease", the answer should be NEGATIVE if it decreased.
+- NEVER drop a negative sign. If your computation gives -118255.5, output -118255.5, not 118255.5.
+- Double-check: does your sign match the direction described in the question?
 
 FORMATTING RULES:
 - Emit exactly one value (or one list). Multiple candidate numbers will AUTO-FAIL.
 - No units suffix. Use bare number.
 - Never output "no answer found" — give your best numeric guess.
+- Write Python code (using print()) for ALL arithmetic. Show final value clearly.
 
 You MUST always end with both tags:
 <REASONING>
@@ -53,6 +59,10 @@ You MUST always end with both tags:
 [bare number or value only]
 </FINAL_ANSWER>"""
 
+REFINE_SYSTEM = """You previously drafted an answer but it may be incomplete or wrong.
+Re-read the new excerpts and submit a corrected final answer using the same format.
+Pay special attention to: correct sign (negative/positive), correct units, exact digits."""
+
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
 _REASONING_RE = re.compile(r"<REASONING>\s*(.*?)\s*</REASONING>", re.DOTALL | re.IGNORECASE)
@@ -61,7 +71,6 @@ _NUM_RE = re.compile(r"-?\d+(?:[,\d]*\d)?(?:\.\d+)?%?")
 
 
 def _years_in(text: str) -> list[int]:
-    """Extract years from text and widen by ±1 for fiscal year robustness."""
     years = set(int(y) for y in _YEAR_RE.findall(text))
     widened = set(years)
     for y in years:
@@ -77,6 +86,25 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         return json.loads(m.group(0))
     except Exception:
         return None
+
+
+def _extract_reasoning(text: str) -> str | None:
+    m = _REASONING_RE.search(text or "")
+    return m.group(1).strip() if m else None
+
+
+def _extract_final_answer(text: str) -> str | None:
+    m = _FINAL_RE.search(text or "")
+    return m.group(1).strip() if m else None
+
+
+def _missing_info(text: str) -> bool:
+    fa = _extract_final_answer(text) or ""
+    rt = _extract_reasoning(text) or ""
+    flags = ["cannot find", "not found", "not available", "unable to", "no data",
+             "insufficient", "not enough", "do not have", "missing"]
+    haystack = (fa + " " + rt).lower()
+    return any(f in haystack for f in flags) or not fa.strip()
 
 
 def _format_chunks(chunks: list[Chunk]) -> str:
@@ -120,7 +148,12 @@ def _normalize_response(text: str) -> str:
             non_years = [n for n in unique if not _is_year(n)]
             f = non_years[0] if non_years else unique[0]
 
-    return f"<REASONING>\n{r}\n</REASONING>\n<FINAL_ANSWER>\n{f.strip()}\n</FINAL_ANSWER>"
+    # Fix list formatting: ensure "space after comma" in bracket lists
+    f = f.strip()
+    if re.match(r"^\[.*\]$", f):
+        f = re.sub(r",\s*", ", ", f)
+
+    return f"<REASONING>\n{r}\n</REASONING>\n<FINAL_ANSWER>\n{f}\n</FINAL_ANSWER>"
 
 
 def _is_year(s: str) -> bool:
@@ -129,6 +162,23 @@ def _is_year(s: str) -> bool:
         return 1900 <= v <= 2100 and v == int(v)
     except Exception:
         return False
+
+
+def _sandboxed_python(code: str) -> str:
+    """Execute Python code locally and return stdout."""
+    import io
+    import contextlib
+    namespace = {"__name__": "__main__"}
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            exec(code, namespace)
+        out = buf.getvalue() or "(no stdout)"
+    except Exception as e:
+        out = f"Error: {type(e).__name__}: {e}"
+    if len(out) > 4000:
+        out = out[:4000] + "\n...[truncated]"
+    return out
 
 
 @dataclass
@@ -143,12 +193,28 @@ class OfficeQAAgent:
         self.corpus = corpus
         self.client = client or OpenAI()
 
+    def _respond(self, system: str, user: str, effort: str | None = None) -> str:
+        eff = effort or REASONING_EFFORT
+        t0 = time.time()
+        try:
+            tools = [{"type": "code_interpreter", "container": {"type": "auto"}}]
+            resp = self.client.responses.create(
+                model=MODEL,
+                instructions=system,
+                input=[{"role": "user", "content": user}],
+                reasoning={"effort": eff},
+                tools=tools,
+            )
+            raw = resp.output_text or ""
+            logger.info("LLM call: %.1fs, len=%d", time.time() - t0, len(raw))
+            return raw
+        except Exception:
+            logger.exception("OpenAI API failed (%.1fs)", time.time() - t0)
+            raise
+
     def _analyze(self, question: str) -> tuple[list[int], str]:
-        """Fast LLM call to extract years and generate a better search query."""
-        # Always extract years from text as baseline
         years = _years_in(question)
         query = question
-
         try:
             t0 = time.time()
             resp = self.client.responses.create(
@@ -158,24 +224,22 @@ class OfficeQAAgent:
                 reasoning={"effort": "low"},
             )
             raw = resp.output_text or ""
-            logger.info("Analyze LLM: %.1fs", time.time() - t0)
-
+            logger.info("Analyze: %.1fs", time.time() - t0)
             plan = _extract_json(raw)
             if plan:
                 if plan.get("years"):
-                    extra_years = set(plan["years"])
-                    for y in list(extra_years):
-                        extra_years.update({y - 1, y + 1})
-                    years = sorted(set(years) | extra_years)
+                    extra = set(plan["years"])
+                    for y in list(extra):
+                        extra.update({y - 1, y + 1})
+                    years = sorted(set(years) | extra)
                 if plan.get("query"):
                     query = plan["query"]
         except Exception as e:
-            logger.warning("Analyze failed, using regex years: %s", e)
-
+            logger.warning("Analyze failed: %s", e)
         return years, query
 
     def answer_question(self, question: str) -> AgentResult:
-        # 1. Analyze: fast LLM call for better years + query
+        # 1. Analyze (fast, effort=low)
         years, query = self._analyze(question)
         logger.info("Years: %s, Query: %.80s", years, query)
 
@@ -185,34 +249,43 @@ class OfficeQAAgent:
         chunks = [c for c, _ in hits]
         logger.info("Retrieved %d chunks in %.1fs", len(chunks), time.time() - t0)
 
-        # 3. Single GPT call with code_interpreter
+        # 3. Answer (main call)
         context = _format_chunks(chunks)
         user_prompt = f"QUESTION:\n{question}\n\nRETRIEVED EXCERPTS ({len(chunks)}):\n{context}\n"
-
         try:
-            t0 = time.time()
-            tools = [{"type": "code_interpreter", "container": {"type": "auto"}}]
-            resp = self.client.responses.create(
-                model=MODEL,
-                instructions=ANSWER_SYSTEM,
-                input=[{"role": "user", "content": user_prompt}],
-                reasoning={"effort": REASONING_EFFORT},
-                tools=tools,
-            )
-            raw = resp.output_text or ""
-            logger.info("Answer LLM: %.1fs, len=%d", time.time() - t0, len(raw))
+            draft = self._respond(ANSWER_SYSTEM, user_prompt)
         except Exception as e:
-            logger.exception("OpenAI API failed: %s", e)
-            raw = f"<REASONING>API error: {e}</REASONING>\n<FINAL_ANSWER>0</FINAL_ANSWER>"
+            draft = f"<REASONING>API error: {e}</REASONING>\n<FINAL_ANSWER>0</FINAL_ANSWER>"
 
-        normalized = _normalize_response(raw)
-        r = _REASONING_RE.search(normalized)
-        f = _FINAL_RE.search(normalized)
+        # 4. Refine if answer admits missing info
+        if _missing_info(draft):
+            logger.info("Low confidence, refining...")
+            try:
+                reasoning_text = _extract_reasoning(draft) or draft
+                draft_final = _extract_final_answer(draft) or ""
+                extra_query = query + " " + reasoning_text[:800] + " " + draft_final
+                second_hits = self.corpus.search(extra_query, top_k=TOP_K_REFINE, year_filter=years or None)
+                seen = {c.chunk_id for c in chunks[:6]}
+                new_chunks = [c for c in [h for h, _ in second_hits] if c.chunk_id not in seen][:TOP_K_REFINE]
+                combined = chunks[:6] + new_chunks
 
-        logger.info("Final answer: %s", f.group(1).strip()[:100] if f else "NONE")
+                refine_context = _format_chunks(combined)
+                refine_prompt = (
+                    f"QUESTION:\n{question}\n\n"
+                    f"YOUR PRIOR DRAFT:\n{draft}\n\n"
+                    f"NEW RETRIEVED EXCERPTS ({len(combined)}):\n{refine_context}\n"
+                )
+                draft = self._respond(REFINE_SYSTEM, refine_prompt, effort="high")
+            except Exception as e:
+                logger.warning("Refine failed: %s", e)
+
+        normalized = _normalize_response(draft)
+        r = _extract_reasoning(normalized)
+        f = _extract_final_answer(normalized)
+        logger.info("Final answer: %s", (f or "NONE")[:100])
 
         return AgentResult(
-            reasoning=r.group(1).strip() if r else "",
-            final_answer=f.group(1).strip() if f else "0",
+            reasoning=r or "",
+            final_answer=f or "0",
             raw_response=normalized,
         )
