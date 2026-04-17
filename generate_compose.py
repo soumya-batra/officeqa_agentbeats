@@ -43,9 +43,17 @@ def build_compose(scenario: dict) -> dict:
 
     green = scenario.get("green_agent", {})
     green_env = green.get("env", {})
+    judge_service: dict = {"container_name": "officeqa-judge"}
+    green_build = green.get("build")
+    if green_build:
+        if isinstance(green_build, str):
+            judge_service["build"] = {"context": ".", "dockerfile": green_build}
+        else:
+            judge_service["build"] = green_build
+    else:
+        judge_service["image"] = green.get("image", "ghcr.io/OWNER/officeqa-judge:latest")
     services["judge"] = {
-        "image": green.get("image", "ghcr.io/OWNER/officeqa-judge:latest"),
-        "container_name": "officeqa-judge",
+        **judge_service,
         "command": ["--host", "0.0.0.0", "--port", "9009", "--card-url", "http://judge:9009"],
         "ports": ["9009:9009"],
         "environment": {
@@ -90,9 +98,17 @@ def build_compose(scenario: dict) -> dict:
             participant_env = {**participant_env, "WRITE_DEBUG_ARTIFACTS": "true"}
         if "LLM_CACHE_PATH" not in participant_env:
             participant_env = {**participant_env, "LLM_CACHE_PATH": "/app/output/llm_cache.json"}
+        participant_service: dict = {"container_name": name.replace("_", "-")}
+        participant_build = participant.get("build")
+        if participant_build:
+            if isinstance(participant_build, str):
+                participant_service["build"] = {"context": ".", "dockerfile": participant_build}
+            else:
+                participant_service["build"] = participant_build
+        else:
+            participant_service["image"] = participant.get("image", "ghcr.io/OWNER/officeqa-agent:latest")
         services[name] = {
-            "image": participant.get("image", "ghcr.io/OWNER/officeqa-agent:latest"),
-            "container_name": name.replace("_", "-"),
+            **participant_service,
             "command": ["--host", "0.0.0.0", "--port", "9009", "--card-url", f"http://{name}:9009"],
             "ports": [f"{host_port}:9009"],
             "environment": {
@@ -156,6 +172,11 @@ def write_a2a_scenario(scenario: dict) -> None:
             rendered = f'"{value}"'
         elif isinstance(value, bool):
             rendered = "true" if value else "false"
+        elif isinstance(value, list):
+            items = ", ".join(
+                f'"{v}"' if isinstance(v, str) else str(v) for v in value
+            )
+            rendered = f"[{items}]"
         else:
             rendered = str(value)
         lines.append(f"{key} = {rendered}")

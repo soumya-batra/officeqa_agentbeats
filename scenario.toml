@@ -1,18 +1,19 @@
 [green_agent]
 agentbeats_id = ""
-image = "ghcr.io/arnavsinghvi11/officeqa-judge:latest"
+build = "Dockerfile.officeqa-judge"
 env = { LOG_LEVEL = "INFO" }
 
 [[participants]]
 agentbeats_id = ""
 name = "officeqa_agent"
-image = "officeqa-agent-local:latest"
-env = { LLM_PROVIDER = "${LLM_PROVIDER}", OPENAI_API_KEY = "${OPENAI_API_KEY}", OPENAI_MODEL = "${OPENAI_MODEL}", ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}", ANTHROPIC_MODEL = "${ANTHROPIC_MODEL}", ENABLE_WEB_SEARCH = "${ENABLE_WEB_SEARCH}", CORPUS_DIR = "${CORPUS_DIR}", FAISS_INDEX_DIR = "${FAISS_INDEX_DIR}", CPI_DATA_PATH = "${CPI_DATA_PATH}", RETRIEVAL_TOP_K = "${RETRIEVAL_TOP_K}", REASONING_EFFORT = "${REASONING_EFFORT}" }
+build = "Dockerfile.officeqa-agent"
+env = { LLM_PROVIDER = "nebius", NEBIUS_API_KEY = "${NEBIUS_API_KEY}", NEBIUS_MODEL = "${NEBIUS_MODEL}", NEBIUS_BASE_URL = "${NEBIUS_BASE_URL}", RETRIEVAL_TOP_K = "8", FAISS_INDEX_DIR = "${FAISS_INDEX_DIR}", TAVILY_API_KEY = "${TAVILY_API_KEY}" }
 
 [config]
 dataset_url = "https://raw.githubusercontent.com/databricks/officeqa/main/officeqa_full.csv"
 corpus_url = "https://github.com/databricks/officeqa/tree/main/treasury_bulletins_parsed"
-num_questions = 246
+num_questions = 15
 difficulty = "all"
+uids = ["UID0003", "UID0004", "UID0005", "UID0007", "UID0008", "UID0010", "UID0015", "UID0016", "UID0017", "UID0018", "UID0019", "UID0022", "UID0025", "UID0012", "UID0014"]
 tolerance = 0.0
-max_concurrent = 2
+max_concurrent = 4

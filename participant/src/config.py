@@ -23,6 +23,8 @@ class SolverConfig:
     anthropic_max_tokens: int
     gemini_model: str
     gemini_embedding_model: str
+    nebius_model: str
+    nebius_base_url: str
     reasoning_effort: str
     enable_web_search: bool
     corpus_dir: Path | None
@@ -56,6 +58,8 @@ class SolverConfig:
             anthropic_max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000")),
             gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview"),
             gemini_embedding_model=os.environ.get("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001"),
+            nebius_model=os.environ.get("NEBIUS_MODEL", "nebius/moonshotai/Kimi-K2.5-fast"),
+            nebius_base_url=os.environ.get("NEBIUS_BASE_URL", "https://api.studio.nebius.com/v1/"),
             reasoning_effort=os.environ.get("REASONING_EFFORT", ""),
             enable_web_search=_env_bool("ENABLE_WEB_SEARCH"),
             corpus_dir=corpus_dir,

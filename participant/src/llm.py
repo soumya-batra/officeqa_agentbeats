@@ -1,8 +1,22 @@
 import os
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
+
+# Kimi sometimes emits native tool-call markup in message.content instead of
+# populating the OpenAI-standard `tool_calls` field. Parse it ourselves so we
+# still execute the tool and feed the result back.
+_KIMI_TOOL_CALL_RE = re.compile(
+    r"<\|tool_call_begin\|>\s*(\S+?)\s*<\|tool_call_argument_begin\|>\s*(.*?)\s*<\|tool_call_end\|>",
+    re.DOTALL,
+)
+_KIMI_SECTION_WRAPPER_RE = re.compile(
+    r"<\|tool_calls_section_begin\|>.*?<\|tool_calls_section_end\|>",
+    re.DOTALL,
+)
+_KIMI_ORPHAN_MARKER_RE = re.compile(r"<\|tool_call[^|]*\|>")
 
 from config import SolverConfig
 
@@ -29,6 +43,53 @@ except ImportError:
     GEMINI_AVAILABLE = False
 
 
+def _sandboxed_python(code: str, namespace: dict | None = None) -> str:
+    import io
+    import contextlib
+    import subprocess
+
+    if namespace is None:
+        namespace = {"__name__": "__main__"}
+
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            exec(code, namespace)
+        out = buf.getvalue() or "(no stdout)"
+    except ModuleNotFoundError as e:
+        module = e.name or str(e).split("'")[1] if "'" in str(e) else str(e)
+        print(f"[AUTO-INSTALL] pip install {module}", flush=True)
+        subprocess.run(["pip", "install", "-q", module], capture_output=True, timeout=60)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                exec(code, namespace)
+            out = buf.getvalue() or "(no stdout)"
+        except Exception as e2:
+            out = f"Error: {type(e2).__name__}: {e2}"
+    except Exception as e:
+        out = f"Error: {type(e).__name__}: {e}"
+    if len(out) > 4000:
+        out = out[:4000] + "\n...[truncated]"
+    return out
+
+
+def _tavily_search(query: str) -> str:
+    api_key = os.environ.get("TAVILY_API_KEY", "")
+    if not api_key:
+        return "Error: TAVILY_API_KEY not set"
+    try:
+        from tavily import TavilyClient
+        client = TavilyClient(api_key=api_key)
+        resp = client.search(query, max_results=3)
+        parts = []
+        for r in resp.get("results", []):
+            parts.append(f"[{r.get('title','')}]\n{r.get('content','')}")
+        return "\n\n".join(parts)[:4000] if parts else "No results found"
+    except Exception as e:
+        return f"Search error: {e}"
+
+
 class LLMClient:
     def __init__(self, config: SolverConfig):
         self._config = config
@@ -42,22 +103,31 @@ class LLMClient:
         if cached is not None:
             return cached
 
+        use_nebius = (
+            OPENAI_AVAILABLE
+            and os.environ.get("NEBIUS_API_KEY")
+            and (provider == "nebius" or (provider == "" and os.environ.get("NEBIUS_API_KEY") and not os.environ.get("OPENAI_API_KEY") and not os.environ.get("GOOGLE_API_KEY")))
+        )
         use_gemini = (
             GEMINI_AVAILABLE
             and os.environ.get("GOOGLE_API_KEY")
-            and (provider == "gemini" or (provider == "" and os.environ.get("GOOGLE_API_KEY") and not os.environ.get("OPENAI_API_KEY")))
+            and (provider == "gemini" or (provider == "" and os.environ.get("GOOGLE_API_KEY") and not os.environ.get("OPENAI_API_KEY") and not use_nebius))
         )
         use_openai = (
             OPENAI_AVAILABLE
             and os.environ.get("OPENAI_API_KEY")
-            and (provider == "openai" or (provider == "" and not os.environ.get("ANTHROPIC_API_KEY") and not use_gemini))
+            and (provider == "openai" or (provider == "" and not os.environ.get("ANTHROPIC_API_KEY") and not use_gemini and not use_nebius))
         )
         use_anthropic = (
             ANTHROPIC_AVAILABLE
             and os.environ.get("ANTHROPIC_API_KEY")
-            and (provider == "anthropic" or (provider == "" and not use_openai and not use_gemini))
+            and (provider == "anthropic" or (provider == "" and not use_openai and not use_gemini and not use_nebius))
         )
 
+        if use_nebius:
+            response = self._complete_nebius(system_prompt=system_prompt, prompt=prompt)
+            self._store_cache(cache_key, response)
+            return response
         if use_gemini:
             response = self._complete_gemini(system_prompt=system_prompt, prompt=prompt)
             self._store_cache(cache_key, response)
@@ -81,6 +151,7 @@ class LLMClient:
                 "openai_model": self._config.openai_model,
                 "anthropic_model": self._config.anthropic_model,
                 "gemini_model": self._config.gemini_model,
+                "nebius_model": self._config.nebius_model,
                 "system_prompt": system_prompt,
                 "prompt": prompt,
                 "reasoning_effort": self._config.reasoning_effort,
@@ -104,6 +175,8 @@ class LLMClient:
 
     def _store_cache(self, cache_key: str, response: str) -> None:
         if self._cache_path is None or cache_key in self._cache:
+            return
+        if not response or not response.strip():
             return
         self._cache[cache_key] = response
         self._cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,6 +238,214 @@ class LLMClient:
         )
         return response.choices[0].message.content or ""
 
+    def _complete_nebius(self, *, system_prompt: str, prompt: str) -> str:
+        client = OpenAI(
+            api_key=os.environ["NEBIUS_API_KEY"],
+            base_url=self._config.nebius_base_url,
+        )
+        model = self._config.nebius_model
+        print(f"\n[LLM] provider=nebius model={model} prompt_len={len(prompt)} chars", flush=True)
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "execute_python",
+                "description": (
+                    "Execute Python code and return its stdout. Use this for ANY non-trivial "
+                    "arithmetic: sums, percentages, regressions, KL divergence, rounding to N "
+                    "decimal places. The sandbox has math, statistics, and json available. "
+                    "Always print() the final value you want to read back."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "Python code to execute"},
+                    },
+                    "required": ["code"],
+                },
+            },
+        }]
+        if os.environ.get("TAVILY_API_KEY"):
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": (
+                        "Search the web for factual information not in the retrieved context. "
+                        "Useful for historical dates, bureau names, exchange rates, and other "
+                        "reference facts."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query"},
+                        },
+                        "required": ["query"],
+                    },
+                },
+            })
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+
+        MAX_TOOL_ITERS = 5
+        EMPTY_RETRIES = 2
+
+        for empty_attempt in range(EMPTY_RETRIES + 1):
+            cur_messages = list(messages)
+            sandbox_ns = {"__name__": "__main__"}
+
+            for iteration in range(MAX_TOOL_ITERS + 1):
+                kwargs = {
+                    "model": model,
+                    "messages": cur_messages,
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "max_tokens": 12000,
+                }
+                if iteration < MAX_TOOL_ITERS:
+                    kwargs["tools"] = tools
+                response = self._nebius_call_with_retry(client, kwargs)
+
+                msg = response.choices[0].message
+                tool_calls = getattr(msg, "tool_calls", None) or []
+
+                if tool_calls:
+                    parsed_calls = [
+                        (tc.id, tc.function.name, tc.function.arguments or "")
+                        for tc in tool_calls
+                    ]
+                    clean_content = msg.content or ""
+                elif msg.content and "<|tool_call_begin|>" in msg.content:
+                    parsed_calls, clean_content = self._parse_kimi_native_tool_calls(msg.content)
+                    if parsed_calls:
+                        print(
+                            f"[KIMI native-markup tool calls parsed: {len(parsed_calls)} iter={iteration}]",
+                            flush=True,
+                        )
+                else:
+                    parsed_calls, clean_content = [], msg.content or ""
+
+                if not parsed_calls:
+                    if clean_content.strip():
+                        return clean_content
+                    if empty_attempt < EMPTY_RETRIES:
+                        print(f"[KIMI empty response, retry {empty_attempt+1}/{EMPTY_RETRIES}]", flush=True)
+                    break
+
+                cur_messages.append({
+                    "role": "assistant",
+                    "content": clean_content,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": args_json},
+                        }
+                        for call_id, name, args_json in parsed_calls
+                    ],
+                })
+
+                for call_id, name, args_json in parsed_calls:
+                    try:
+                        args = json.loads(args_json or "{}")
+                    except Exception as parse_err:
+                        result = f"Error parsing tool arguments: {parse_err}"
+                    else:
+                        if name == "web_search":
+                            query = args.get("query", "")
+                            print(f"\n[KIMI web_search iter={iteration}] {query}", flush=True)
+                            result = _tavily_search(query)
+                            print(f"[KIMI search result]\n{result[:400]}", flush=True)
+                        else:
+                            code = args.get("code", "")
+                            print(f"\n[KIMI execute_python iter={iteration}]\n{code[:800]}", flush=True)
+                            result = _sandboxed_python(code, namespace=sandbox_ns)
+                            print(f"[KIMI tool result]\n{result[:400]}", flush=True)
+                    cur_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": name,
+                        "content": result,
+                    })
+            else:
+                return msg.content or ""
+
+        return ""
+
+    @staticmethod
+    def _parse_kimi_native_tool_calls(content: str) -> tuple[list[tuple[str, str, str]], str]:
+        calls: list[tuple[str, str, str]] = []
+        for m in _KIMI_TOOL_CALL_RE.finditer(content):
+            call_id = m.group(1).strip()
+            args_json = m.group(2).strip()
+            calls.append((call_id, "execute_python", args_json))
+        clean = _KIMI_SECTION_WRAPPER_RE.sub("", content)
+        clean = _KIMI_ORPHAN_MARKER_RE.sub("", clean).strip()
+        return calls, clean
+
+    def _nebius_call_with_retry(self, client, kwargs):
+        # Retry 429 "Model is busy" and 400 "Connection error" only.
+        # Do NOT retry 504 (timeout) or context-blowout 400s (won't shrink).
+        # Budget: 3 attempts, backoffs 3s/8s → +11s worst-case per call,
+        # safely inside the 300s per-question judge timeout.
+        backoffs = [3, 8]
+        max_attempts = len(backoffs) + 1
+        for attempt in range(max_attempts):
+            try:
+                return client.chat.completions.create(**kwargs)
+            except Exception as e:
+                err_text = str(e)
+                err_lower = err_text.lower()
+                status = getattr(e, "status_code", None) or getattr(
+                    getattr(e, "response", None), "status_code", None
+                )
+                # Never retry: 504, context blowouts
+                if status == 504 or "504" in err_text or "gateway timeout" in err_lower:
+                    self._log_nebius_error(e)
+                    raise
+                if "splited_prompt_len" in err_lower or "max_seq_len" in err_lower:
+                    self._log_nebius_error(e)
+                    raise
+                # Retryable: 429 / "Model is busy" / "Connection error"
+                is_busy = status == 429 or "model is busy" in err_lower or "21354" in err_text
+                is_conn = "connection error" in err_lower
+                if (is_busy or is_conn) and attempt < max_attempts - 1:
+                    wait = backoffs[attempt]
+                    import logging
+                    kind = "busy" if is_busy else "conn"
+                    logging.getLogger(__name__).warning(
+                        f"Nebius retryable error ({kind}), retry in {wait}s (attempt {attempt+1}/{max_attempts})"
+                    )
+                    time.sleep(wait)
+                    continue
+                self._log_nebius_error(e)
+                raise
+
+    def _log_nebius_error(self, e):
+        import logging, traceback
+        log = logging.getLogger(__name__)
+        log.error("=== NEBIUS ERROR ===")
+        log.error("type=%s", type(e).__name__)
+        log.error("repr=%r", e)
+        log.error("str=%s", str(e))
+        for attr in ("status_code", "code", "message", "body", "response", "request_id"):
+            val = getattr(e, attr, None)
+            if val is not None:
+                log.error("e.%s = %r", attr, val)
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                log.error("response.status_code=%s", getattr(resp, "status_code", None))
+                log.error("response.headers=%s", dict(getattr(resp, "headers", {}) or {}))
+                log.error("response.text=%s", getattr(resp, "text", None))
+            except Exception as inner:
+                log.error("could not introspect response: %r", inner)
+        log.error("traceback:\n%s", traceback.format_exc())
+        log.error("=== END NEBIUS ERROR ===")
+
     def complete_cheap(self, *, system_prompt: str, prompt: str) -> str:
         """Call a cheap/fast model with JSON response format.
 
@@ -173,6 +454,23 @@ class LLMClient:
         """
         import os
         provider = self._config.llm_provider
+        # Nebius path — reuse the configured Kimi model for cheap calls
+        if (provider == "nebius" or (provider == "" and os.environ.get("NEBIUS_API_KEY") and not os.environ.get("OPENAI_API_KEY") and not os.environ.get("GOOGLE_API_KEY"))) and OPENAI_AVAILABLE:
+            client = OpenAI(
+                api_key=os.environ["NEBIUS_API_KEY"],
+                base_url=self._config.nebius_base_url,
+            )
+            response = client.chat.completions.create(
+                model=self._config.nebius_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                max_tokens=512,
+                response_format={"type": "json_object"},
+            )
+            return response.choices[0].message.content or ""
         # Gemini path — use gemini-3-flash for fast reformulation tasks
         if (provider == "gemini" or (not os.environ.get("OPENAI_API_KEY"))) and GEMINI_AVAILABLE and os.environ.get("GOOGLE_API_KEY"):
             client = genai.Client()

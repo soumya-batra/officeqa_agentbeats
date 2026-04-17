@@ -9,15 +9,14 @@ IMAGE="ghcr.io/soumya-batra/officeqa-agent:latest"
 rm -rf .docker-corpus
 cp -r treasury_bulletins_transformed .docker-corpus
 
-# FAISS index — only the files the server actually needs:
-#   gemini/index.faiss, gemini/chunks.json  (semantic search)
-#   bm25.pkl, year_index.json               (keyword + year filtering)
+# FAISS index (txt_meta4 variant — best performing):
+#   nebius/index.faiss, nebius/chunks.json  (semantic search)
+#   bm25s/                                  (stemmed keyword search)
 rm -rf .docker-faiss
-mkdir -p .docker-faiss/gemini
-cp faiss_index/gemini/index.faiss  .docker-faiss/gemini/
-cp faiss_index/gemini/chunks.json  .docker-faiss/gemini/
-cp faiss_index/bm25.pkl            .docker-faiss/
-cp faiss_index/year_index.json     .docker-faiss/
+mkdir -p .docker-faiss/nebius
+cp faiss_index_txt_meta4/nebius/index.faiss  .docker-faiss/nebius/
+cp faiss_index_txt_meta4/nebius/chunks.json  .docker-faiss/nebius/
+cp -r faiss_index_txt_meta4/bm25s            .docker-faiss/bm25s
 
 echo "Staged corpus (~367 MB) + FAISS index (~2.4 GB) into build context"
 

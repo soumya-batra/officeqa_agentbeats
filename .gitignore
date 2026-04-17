@@ -13,4 +13,8 @@ output/solver_debug/
 output/answer_cache.json
 output/results_*.json
 treasury_bulletins_transformed/
+treasury_bulletins_parsed/
 faiss_index/
+faiss_index_*/
+.docker-corpus/
+.docker-faiss/

@@ -30,6 +30,7 @@ class Executor(AgentExecutor):
     def __init__(self):
         self._contexts: dict[str, list[dict]] = {}
         self._solver = OfficeQASolver()
+        self._solve_lock = asyncio.Lock()
 
     async def execute(
         self,
@@ -73,7 +74,8 @@ class Executor(AgentExecutor):
                 break
 
         try:
-            result = await asyncio.to_thread(self._solver.solve_question, question_text)
+            async with self._solve_lock:
+                result = await asyncio.to_thread(self._solver.solve_question, question_text)
             response = render_solver_result(result)
         except Exception as e:
             logger.exception(f"LLM call failed: {e}")

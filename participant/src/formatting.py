@@ -260,13 +260,48 @@ def canonicalize_final_answer(question: str, final_answer: str) -> str:
     return _maybe_append_unit(result, question)
 
 
+_ANSWER_PHRASE_RE = re.compile(
+    r"(?:(?:the\s+)?(?:final\s+)?answer\s+is|total\s+(?:is|=|:)|therefore|thus)[:\s]*"
+    r"(-?\$?[\d,]+\.?\d*%?)",
+    re.IGNORECASE,
+)
+
+_LAST_NUMBER_RE = re.compile(r"-?\$?[\d,]+\.?\d*%?")
+
+
+def _is_year(token: str) -> bool:
+    bare = token.replace(",", "").rstrip("%").replace(".", "").lstrip("-")
+    if not bare.isdigit():
+        return False
+    try:
+        return 1900 <= int(bare) <= 2100
+    except ValueError:
+        return False
+
+
+def _fallback_extract_answer(text: str) -> str:
+    """Try to pull a numeric answer from free text when FINAL_ANSWER tag is missing."""
+    m = _ANSWER_PHRASE_RE.search(text)
+    if m:
+        return m.group(1).replace("$", "")
+    numbers = [n.replace("$", "") for n in _LAST_NUMBER_RE.findall(text) if not _is_year(n)]
+    if numbers:
+        return numbers[-1]
+    return ""
+
+
 def ensure_structured_response(raw_response: str) -> tuple[str, str]:
     reasoning = extract_tag(raw_response, "REASONING")
     final_answer = extract_tag(raw_response, "FINAL_ANSWER")
 
     cleaned = raw_response.strip()
     if not final_answer:
-        final_answer = cleaned or "Unable to determine"
+        if reasoning:
+            final_answer = _fallback_extract_answer(reasoning)
+        if not final_answer:
+            final_answer = _fallback_extract_answer(cleaned)
+        if not final_answer:
+            final_answer = cleaned or "Unable to determine"
     if not reasoning:
         reasoning = "Derived from the solver pipeline output."
     return reasoning, final_answer

@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
+NEBIUS_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
+NEBIUS_BASE_URL_DEFAULT = "https://api.studio.nebius.com/v1/"
 MAX_BATCH_TOKENS = 250_000
 RRF_K = 60            # standard RRF constant
 GLOBAL_CANDIDATE_K = 50   # how many each of FAISS global and BM25 global contribute
@@ -24,10 +26,16 @@ ERA_CANDIDATE_K = 200     # how many year-era FAISS contributes (already filtere
 def _detect_embedding_provider() -> str:
     """Determine which embedding provider to use based on env vars."""
     provider = os.environ.get("LLM_PROVIDER", "").lower()
+    if provider == "nebius" and os.environ.get("NEBIUS_API_KEY"):
+        return "nebius"
     if provider == "gemini" and os.environ.get("GOOGLE_API_KEY"):
         return "gemini"
+    if provider in ("openai", "anthropic"):
+        return "openai"
     if os.environ.get("OPENAI_API_KEY"):
         return "openai"
+    if os.environ.get("NEBIUS_API_KEY"):
+        return "nebius"
     if os.environ.get("GOOGLE_API_KEY"):
         return "gemini"
     return "openai"  # fallback
@@ -39,10 +47,10 @@ class FaissRetriever:
         self._index  = None
         self._chunks: list[dict] = []
         self._bm25   = None
-        self._bm25_corpus: list[list[str]] = []
-        # Offline indices built after chunks are loaded
-        self._chunk_bulletin_year: list[int | None] = []   # bulletin year per chunk
-        self._year_content_index: dict[int, list[int]] = {}  # year -> chunk indices containing that year
+        self._bm25_type = None  # "bm25s" or "rank_bm25"
+        self._bm25_stemmer = None
+        self._chunk_bulletin_year: list[int | None] = []
+        self._year_content_index: dict[int, list[int]] = {}
 
         self._embedding_provider = _detect_embedding_provider()
         logger.info("Embedding provider: %s", self._embedding_provider)
@@ -54,7 +62,6 @@ class FaissRetriever:
         index_path    = provider_dir / "index.faiss"
         meta_path     = provider_dir / "chunks.json"
         bm25_path     = provider_dir / "bm25.pkl"
-        year_idx_path = provider_dir / "year_index.json"
 
         # Check for existing chunks from ANY provider or root dir (for BM25 reuse)
         any_meta = None
@@ -85,13 +92,14 @@ class FaissRetriever:
         else:
             self._build(corpus_dir, provider_dir, index_path, meta_path)
 
-        # Reuse BM25/year_index from root dir if not in provider dir
+        # Reuse BM25 from root dir if not in provider dir
         if not bm25_path.exists() and (index_dir / "bm25.pkl").exists():
             bm25_path = index_dir / "bm25.pkl"
-        if not year_idx_path.exists() and (index_dir / "year_index.json").exists():
-            year_idx_path = index_dir / "year_index.json"
 
-        self._build_bm25(bm25_path)
+        bm25s_dir = index_dir / "bm25s"
+        self._load_bm25(bm25s_dir, bm25_path)
+
+        year_idx_path = index_dir / "year_index.json"
         self._build_year_index(year_idx_path)
 
     # ── BM25 ──────────────────────────────────────────────────────────────────
@@ -99,22 +107,43 @@ class FaissRetriever:
     def _tokenize(self, text: str) -> list[str]:
         return re.findall(r"[a-z0-9]+", text.lower())
 
-    def _build_bm25(self, bm25_path: Path) -> None:
+    def _load_bm25(self, bm25s_dir: Path, bm25_pkl_path: Path) -> None:
+        if bm25s_dir.exists():
+            try:
+                import bm25s
+                import Stemmer
+                self._bm25 = bm25s.BM25.load(str(bm25s_dir))
+                self._bm25_stemmer = Stemmer.Stemmer("english")
+                self._bm25_type = "bm25s"
+                logger.info("Loaded bm25s index from %s", bm25s_dir)
+                return
+            except ImportError:
+                logger.warning("bm25s/PyStemmer not installed; trying rank-bm25")
+        if bm25_pkl_path.exists():
+            try:
+                from rank_bm25 import BM25Okapi
+                import pickle
+                with bm25_pkl_path.open("rb") as f:
+                    self._bm25 = pickle.load(f)
+                self._bm25_type = "rank_bm25"
+                logger.info("Loaded rank-bm25 index from %s", bm25_pkl_path)
+                return
+            except ImportError:
+                logger.warning("rank-bm25 not installed; BM25 disabled")
+        if self._chunks:
+            self._build_bm25_fallback(bm25_pkl_path)
+
+    def _build_bm25_fallback(self, bm25_path: Path) -> None:
         try:
             from rank_bm25 import BM25Okapi
         except ImportError:
-            logger.warning("rank-bm25 not installed; BM25 disabled")
+            logger.warning("No BM25 library available; BM25 disabled")
             return
         import pickle
-        if bm25_path.exists():
-            logger.info("Loading BM25 index from %s", bm25_path)
-            with bm25_path.open("rb") as f:
-                self._bm25 = pickle.load(f)
-            logger.info("Loaded BM25 index")
-            return
         logger.info("Building BM25 index over %d chunks", len(self._chunks))
-        self._bm25_corpus = [self._tokenize(c["content"]) for c in self._chunks]
-        self._bm25 = BM25Okapi(self._bm25_corpus)
+        corpus = [self._tokenize(c["content"]) for c in self._chunks]
+        self._bm25 = BM25Okapi(corpus)
+        self._bm25_type = "rank_bm25"
         with bm25_path.open("wb") as f:
             pickle.dump(self._bm25, f)
         logger.info("Built and saved BM25 index to %s", bm25_path)
@@ -227,6 +256,8 @@ class FaissRetriever:
             try:
                 if self._embedding_provider == "gemini":
                     self._embed_batch_gemini(batch, embeddings)
+                elif self._embedding_provider == "nebius":
+                    self._embed_batch_nebius(batch, embeddings)
                 else:
                     self._embed_batch_openai(batch, embeddings)
                 return
@@ -261,6 +292,18 @@ class FaissRetriever:
             if i + SUB_BATCH < len(batch):
                 time.sleep(0.3)
 
+    def _embed_batch_nebius(self, batch: list[str], embeddings: list) -> None:
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=os.environ["NEBIUS_API_KEY"],
+            base_url=os.environ.get("NEBIUS_BASE_URL", NEBIUS_BASE_URL_DEFAULT),
+        )
+        SUB_BATCH = 32
+        for i in range(0, len(batch), SUB_BATCH):
+            sub = batch[i:i+SUB_BATCH]
+            resp = client.embeddings.create(model=NEBIUS_EMBEDDING_MODEL, input=sub)
+            embeddings.extend([e.embedding for e in resp.data])
+
     def _embed_query(self, question: str) -> np.ndarray:
         import faiss
 
@@ -269,6 +312,14 @@ class FaissRetriever:
             client = genai.Client()
             resp = client.models.embed_content(model=GEMINI_EMBEDDING_MODEL, contents=question)
             vec = np.array([resp.embeddings[0].values], dtype=np.float32)
+        elif self._embedding_provider == "nebius":
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=os.environ["NEBIUS_API_KEY"],
+                base_url=os.environ.get("NEBIUS_BASE_URL", NEBIUS_BASE_URL_DEFAULT),
+            )
+            resp = client.embeddings.create(model=NEBIUS_EMBEDDING_MODEL, input=[question])
+            vec = np.array([resp.data[0].embedding], dtype=np.float32)
         else:
             from openai import OpenAI
             client = OpenAI()
@@ -282,14 +333,11 @@ class FaissRetriever:
 
     @staticmethod
     def _extract_years(question: str) -> list[int]:
-        # Use (?<!\d) instead of \b so "FY2013" and "FY2023" are matched correctly
         return [int(y) for y in re.findall(r"(?<!\d)(1[89]\d{2}|20\d{2})(?!\d)", question)]
 
     def _build_year_index(self, year_idx_path: Path) -> None:
-        """Precompute bulletin year per chunk and an inverted index: year -> chunk indices."""
         year_pat = re.compile(r"treasury_bulletin_(\d{4})")
 
-        # _chunk_bulletin_year is cheap to rebuild from source paths — always recompute
         self._chunk_bulletin_year = []
         for chunk in self._chunks:
             m = year_pat.search(chunk.get("source", ""))
@@ -310,15 +358,17 @@ class FaissRetriever:
             for year_str in set(content_year_pat.findall(chunk["content"])):
                 self._year_content_index.setdefault(int(year_str), []).append(i)
 
-        with year_idx_path.open("w", encoding="utf-8") as f:
-            json.dump(self._year_content_index, f)
-        logger.info(
-            "Built and saved year index: %d distinct years to %s",
-            len(self._year_content_index), year_idx_path,
-        )
+        try:
+            with year_idx_path.open("w", encoding="utf-8") as f:
+                json.dump(self._year_content_index, f)
+            logger.info(
+                "Built and saved year index: %d distinct years to %s",
+                len(self._year_content_index), year_idx_path,
+            )
+        except OSError:
+            logger.info("Built year index in memory (%d distinct years, read-only filesystem)", len(self._year_content_index))
 
     def _year_era_indices(self, years: list[int], before: int = 1, after: int = 8) -> list[int]:
-        """Indices of chunks from bulletins published within [year-before, year+after] of any detected year."""
         if not years:
             return []
         return [
@@ -327,7 +377,6 @@ class FaissRetriever:
         ]
 
     def _year_content_indices(self, years: list[int], era_set: set[int]) -> list[int]:
-        """Chunk indices that both mention a target year in their text AND are in the era set."""
         result: set[int] = set()
         for year in years:
             result.update(i for i in self._year_content_index.get(year, []) if i in era_set)
@@ -350,6 +399,36 @@ class FaissRetriever:
             bm25_rrf  = bm25_w  / (RRF_K + bm25_ranks[idx] + 1) if idx in bm25_ranks else 0.0
             rrf_scores[idx] = faiss_rrf + bm25_rrf
         return sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
+    def _bm25_top_k(self, question: str, k: int) -> dict[int, int]:
+        """Return {chunk_index: rank} for the top-k BM25 matches."""
+        if self._bm25 is None:
+            return {}
+        if self._bm25_type == "bm25s":
+            import bm25s
+            query_tokens = bm25s.tokenize([question], stopwords="en", stemmer=self._bm25_stemmer, show_progress=False)
+            results, _scores = self._bm25.retrieve(query_tokens, k=k)
+            return {int(idx): rank for rank, idx in enumerate(results[0]) if idx >= 0}
+        tokens = self._tokenize(question)
+        scores = self._bm25.get_scores(tokens)
+        top = np.argsort(scores)[::-1][:k]
+        return {int(idx): rank for rank, idx in enumerate(top)}
+
+    def _bm25_scores_all(self, question: str) -> np.ndarray | None:
+        """Return per-chunk BM25 scores (for candidate filtering in retrieve_by_source_files)."""
+        if self._bm25 is None:
+            return None
+        if self._bm25_type == "bm25s":
+            import bm25s
+            query_tokens = bm25s.tokenize([question], stopwords="en", stemmer=self._bm25_stemmer, show_progress=False)
+            results, scores = self._bm25.retrieve(query_tokens, k=len(self._chunks))
+            out = np.zeros(len(self._chunks))
+            for idx, score in zip(results[0], scores[0]):
+                if idx >= 0:
+                    out[int(idx)] = score
+            return out
+        tokens = self._tokenize(question)
+        return self._bm25.get_scores(tokens)
 
     def retrieve_by_source_files(
         self,
@@ -378,9 +457,8 @@ class FaissRetriever:
 
         # BM25 ranks within candidate set
         bm25_ranks: dict[int, int] = {}
-        if self._bm25 is not None:
-            tokens = self._tokenize(question)
-            all_bm25_scores = self._bm25.get_scores(tokens)
+        all_bm25_scores = self._bm25_scores_all(question)
+        if all_bm25_scores is not None:
             candidate_bm25 = sorted(
                 ((i, all_bm25_scores[i]) for i in candidate_indices),
                 key=lambda x: x[1],
@@ -389,7 +467,7 @@ class FaissRetriever:
             bm25_ranks = {i: rank for rank, (i, _) in enumerate(candidate_bm25[:GLOBAL_CANDIDATE_K])}
 
         if faiss_ranks:
-            top_rrf = self._rrf_fuse(faiss_ranks, bm25_ranks, faiss_w=0.4, bm25_w=0.6)[:self._top_k]
+            top_rrf = self._rrf_fuse(faiss_ranks, bm25_ranks, 0.5, 0.5)[:self._top_k]
         else:
             # BM25-only mode
             top_rrf = sorted(bm25_ranks.items(), key=lambda x: x[1])[:self._top_k]
@@ -404,11 +482,9 @@ class FaissRetriever:
         if not self._chunks:
             return []
 
-        has_faiss = self._index is not None
-
         # FAISS global (semantic) — top GLOBAL_CANDIDATE_K
         faiss_ranks: dict[int, int] = {}
-        if has_faiss:
+        if self._index is not None:
             if query_vec is None:
                 query_vec = self._embed_query(question)
             _, faiss_indices = self._index.search(query_vec, GLOBAL_CANDIDATE_K)
@@ -419,19 +495,14 @@ class FaissRetriever:
             }
 
         # BM25 global (keyword) — top GLOBAL_CANDIDATE_K
-        bm25_ranks: dict[int, int] = {}
-        if self._bm25 is not None:
-            tokens = self._tokenize(question)
-            bm25_scores = self._bm25.get_scores(tokens)
-            top_bm25 = np.argsort(bm25_scores)[::-1][:GLOBAL_CANDIDATE_K]
-            bm25_ranks = {int(idx): rank for rank, idx in enumerate(top_bm25)}
+        bm25_ranks = self._bm25_top_k(question, GLOBAL_CANDIDATE_K)
 
         # Year-era FAISS passes (only when FAISS available)
         detected_years = self._extract_years(question)
         year_era_ranks: dict[int, int] = {}
         year_near_ranks: dict[int, int] = {}
 
-        if detected_years and has_faiss:
+        if detected_years and self._index is not None:
             era_indices  = self._year_era_indices(detected_years, before=1, after=8)
             near_indices = self._year_era_indices(detected_years, before=0, after=5)
             logger.info(
@@ -456,18 +527,16 @@ class FaissRetriever:
                 len(year_era_ranks), len(year_near_ranks),
             )
         elif detected_years and self._bm25 is not None:
-            # BM25-only year boost: prioritize chunks from matching year eras
             era_set = set(self._year_era_indices(detected_years, before=1, after=8))
             content_set = set()
             for yr in detected_years:
                 content_set.update(self._year_content_index.get(yr, []))
-            # Boost BM25 scores for year-matching chunks
             for idx in list(bm25_ranks.keys()):
                 if idx in content_set and idx in era_set:
-                    bm25_ranks[idx] = max(0, bm25_ranks[idx] - 10)  # boost rank
+                    bm25_ranks[idx] = max(0, bm25_ranks[idx] - 10)
 
         # RRF fusion
-        if has_faiss:
+        if self._index is not None:
             all_idx = set(faiss_ranks) | set(bm25_ranks) | set(year_era_ranks) | set(year_near_ranks)
             rrf_scores: dict[int, float] = {}
             has_era  = bool(year_era_ranks)
@@ -490,8 +559,8 @@ class FaissRetriever:
                     )
                 else:
                     score = (
-                        0.60 / (RRF_K + faiss_ranks.get(idx, fallback_rank) + 1)
-                        + 0.40 / (RRF_K + bm25_ranks.get(idx, fallback_rank) + 1)
+                        0.50 / (RRF_K + faiss_ranks.get(idx, fallback_rank) + 1)
+                        + 0.50 / (RRF_K + bm25_ranks.get(idx, fallback_rank) + 1)
                     )
                 rrf_scores[idx] = score
             top_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:self._top_k]

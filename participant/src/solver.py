@@ -1,4 +1,3 @@
-import json
 import logging
 import re
 
@@ -16,95 +15,44 @@ from table_parser import find_calendar_year_total, reformat_tables_in_context
 
 logger = logging.getLogger(__name__)
 
+# Kimi K2.5-fast has max_seq_len=131_083. Reserve ~31K for system prompt,
+# user instructions, tool-call round-trips, and model output (max_tokens=12K).
+# Leaves ~100K for retrieved contexts. Estimate 1 token ≈ 3 chars (conservative
+# — English averages ~4, so this over-counts and under-fills the budget).
+PROMPT_TOKEN_BUDGET = 100_000
+
+
+def _count_tokens(text: str) -> int:
+    return len(text) // 3
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
-DECOMPOSE_SYSTEM_PROMPT = """You are a search query optimizer for US Treasury Bulletin documents.
-
-Given a user question, decompose it into 1-3 retrieval queries optimized for document search.
-For simple lookups, output one query.  For multi-step questions, output sub-queries that each
-target a specific piece of information needed to answer the overall question.
-
-Rules per query:
-- 10-20 words
-- Resolve implicit time references (e.g., "1 year before World War 2" -> 1938)
-- Convert fiscal year notation (FY1934 -> fiscal year 1934)
-- Preserve table names, row labels, column names, specific years, dollar amounts
-- Strip procedural filler ("what was", "find the", "calculate")
-
-Output JSON (no markdown fences):
-{
-  "queries": ["<query 1>", "<query 2 if needed>"]
-}"""
-
 SYSTEM_PROMPT = """You answer questions about U.S. Treasury Bulletin documents using retrieved context.
 
 Rules:
-- Use code_execution for ALL table parsing and arithmetic. Never eyeball numbers from tables.
-- Extract figures from the retrieved context. Use web search only for external data (CPI, exchange rates).
+- Use the retrieved context to answer. When data is ambiguous or partially available, reason through it rather than giving up.
+- Use the execute_python tool for any non-trivial arithmetic (sums, percentages, regressions, KL divergence, rounding to N places). Do not perform multi-step math in prose.
 - Fiscal year (pre-1977): July 1 – June 30. Calendar year: Jan 1 – Dec 31.
 - Preserve full precision; round only at the final step if instructed.
-- Match exact table name, row label, and column. Do not substitute similar categories.
-- Page number questions: report the physical page number (small integer), not section codes.
+- Match exact table name, row label, and column. Do not substitute similar categories or sum unrelated columns.
+- If a web_search tool is available, use it to look up facts not in the retrieved context (e.g. historical dates, bureau names, exchange rates).
+- Preserve the sign of computed values. If computing a change (B − A), difference, or growth rate, keep the negative sign if the result is negative.
+- Output in the exact format requested by the question, if specified.
 
-Output format (keep visible output SHORT):
+You MUST always end your response with both tags below — never omit FINAL_ANSWER:
 <REASONING>
-[1-2 sentence summary]
+[1-2 sentence summary of how you derived the answer]
 </REASONING>
 <FINAL_ANSWER>
 [bare number or value only — no units, no prose, no markdown]
 </FINAL_ANSWER>
 """
 
-PLANNER_SYSTEM_PROMPT = """You are an expert question analyst for U.S. Treasury Bulletin research.
-
-Given a question, produce a structured analysis that will guide retrieval and answering.
-
-Output JSON (no markdown fences):
-{
-  "data_points": ["<specific data point 1 needed>", "<data point 2>"],
-  "table_names": ["<exact table name if mentioned, e.g. FFO-3, FFO-5>"],
-  "time_periods": ["<resolved time period, e.g. fiscal year 1934, February 2012, calendar year 1981>"],
-  "constraints": ["<inclusion/exclusion constraint 1>", "<constraint 2>"],
-  "answer_type": "<scalar|list|page_number|text>",
-  "unit": "<expected unit if specified, e.g. millions of dollars, percentage points, billions>",
-  "extra_queries": ["<additional retrieval query if the question needs data not obvious from the main question>"]
-}
-
-Rules:
-- Resolve ALL implicit time references (e.g. "1 year before WW2" -> "1938", "FY2013 budget proposal release month" -> "February 2012")
-- Extract EVERY inclusion/exclusion constraint (e.g. "excluding territories", "shouldn't contain revolving funds", "net of refunds")
-- Identify exact table names if the question references one (FFO-3, FFO-5, OFS-1, etc.)
-- Keep data_points specific: not "some value" but "total interest-bearing U.S. public debt September 1989"
-- extra_queries should target data the main question text wouldn't directly match in search"""
-
-
 _PAGE_NUMBER_RE = re.compile(
     r"\b(?:page\s*number|what\s+(?:is\s+)?(?:the\s+)?page|which\s+page)\b", re.I
 )
-
-
-def _parse_json_robust(raw: str) -> dict:
-    """Parse JSON from LLM output, handling markdown fences and extra text."""
-    text = raw.strip()
-    # Strip markdown code fences
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-        text = re.sub(r"\n?```\s*$", "", text)
-    # Try direct parse first
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Try to find JSON object within the text
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-    raise json.JSONDecodeError("No valid JSON found", text, 0)
 
 
 class OfficeQASolver:
@@ -124,38 +72,16 @@ class OfficeQASolver:
         core_question = self._extract_core_question(question)
         is_page_q = bool(_PAGE_NUMBER_RE.search(core_question))
 
-        # ── Agent 1: PLANNER ─────────────────────────────────────────
-        plan = self._plan_question(core_question)
-
-        # ── Agent 2: RETRIEVER (multi-strategy) ─────────────────────
-        sub_queries = self._decompose_question(core_question)
-        # Merge planner's extra queries with decomposed queries
-        if plan.get("extra_queries"):
-            for eq in plan["extra_queries"]:
-                if eq and eq not in sub_queries:
-                    sub_queries.append(eq)
-        # Also add table-name-targeted queries from the plan
-        for table_name in plan.get("table_names", []):
-            if table_name:
-                table_query = f"{table_name} Treasury Bulletin table"
-                if table_query not in sub_queries:
-                    sub_queries.append(table_query)
-        # For calendar-month-total questions, add month-specific queries
-        month_queries = self._generate_month_queries(core_question, plan)
-        if month_queries:
-            sub_queries.extend(month_queries)
-            print(f"[MONTH QUERIES] Added {len(month_queries)} month-specific queries")
-
-        has_month_queries = bool(month_queries)
-        contexts = self._collect_multi_query_contexts(sub_queries, source_hints, is_page_q, has_month_queries)
+        # ── Retrieval ────────────────────────────────────────────────
+        sub_queries = [core_question]
+        contexts = self._collect_multi_query_contexts(sub_queries, source_hints, is_page_q)
 
         self._log_chunks(contexts)
         logger.info(
-            "Solving question with source_files=%s source_pages=%s contexts=%s plan=%s",
+            "Solving question with source_files=%s source_pages=%s contexts=%s",
             source_hints.source_files,
             source_hints.source_pages,
             [c.source for c in contexts],
-            plan,
         )
 
         base_debug_payload = {
@@ -163,7 +89,6 @@ class OfficeQASolver:
             "question_uid": question_uid,
             "question_prompt": question,
             "core_question": core_question,
-            "plan": plan,
             "sub_queries": sub_queries,
             "source_hints": source_hints,
             "contexts": build_context_snapshot(contexts),
@@ -178,8 +103,8 @@ class OfficeQASolver:
             if table_data:
                 print(f"[TABLE EXTRACT]\n{table_data}")
 
-            # ── Agent 3: SOLVER ──────────────────────────────────────
-            prompt = self._build_prompt(core_question, contexts, is_page_q, table_data=table_data, plan=plan)
+            # ── Solver ───────────────────────────────────────────────
+            prompt = self._build_prompt(core_question, contexts, is_page_q, table_data=table_data)
             raw_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=prompt)
             reasoning, final_answer = ensure_structured_response(raw_response)
 
@@ -216,90 +141,6 @@ class OfficeQASolver:
             raise
 
     # ------------------------------------------------------------------
-    # Agent 1: Planner
-    # ------------------------------------------------------------------
-
-    def _plan_question(self, core_question: str) -> dict:
-        """Use a cheap model to produce a structured plan from the question."""
-        try:
-            raw = self._llm_client.complete_cheap(
-                system_prompt=PLANNER_SYSTEM_PROMPT,
-                prompt=core_question,
-            )
-            plan = _parse_json_robust(raw)
-            print(f"[PLAN] {json.dumps(plan, indent=2)}")
-            return plan
-        except Exception as exc:
-            logger.warning("Planner failed: %s", exc)
-            return {}
-
-    # ------------------------------------------------------------------
-    # Month-specific retrieval for calendar year questions
-    # ------------------------------------------------------------------
-
-    _MONTHS = ["January", "February", "March", "April", "May", "June",
-               "July", "August", "September", "October", "November", "December"]
-
-    @staticmethod
-    def _generate_month_queries(question: str, plan: dict) -> list[str]:
-        """For questions about 'all individual calendar months in YEAR',
-        generate month-specific retrieval queries to ensure full coverage.
-
-        Only triggers for precise patterns with 1-2 explicit years to avoid
-        flooding retrieval with hundreds of queries.
-        """
-        lowered = question.lower()
-        # Only trigger for the most specific patterns
-        if "all individual calendar months" not in lowered:
-            return []
-
-        # Extract years that appear RIGHT AFTER "months in"
-        # e.g., "all individual calendar months in 1953"
-        year_matches = re.findall(r"calendar months in (\d{4})", lowered)
-        if not year_matches or len(year_matches) > 2:
-            return []
-
-        # Extract the topic
-        topic = ""
-        if plan.get("data_points"):
-            topic = plan["data_points"][0]
-        else:
-            for phrase in ["national defense", "budget expenditures", "public debt",
-                           "receipts", "outlays", "interest"]:
-                if phrase in lowered:
-                    topic = phrase
-                    break
-
-        queries = []
-        for year in set(year_matches):
-            for month in OfficeQASolver._MONTHS:
-                queries.append(f"{topic} {month} {year} Treasury Bulletin")
-        return queries
-
-    # ------------------------------------------------------------------
-    # Question decomposition (multi-query)
-    # ------------------------------------------------------------------
-
-    def _decompose_question(self, core_question: str) -> list[str]:
-        """Use a cheap model to decompose the question into 1-3 retrieval sub-queries."""
-        try:
-            raw = self._llm_client.complete_cheap(
-                system_prompt=DECOMPOSE_SYSTEM_PROMPT,
-                prompt=core_question,
-            )
-            parsed = _parse_json_robust(raw)
-            queries = parsed.get("queries") or [core_question]
-            # Sanity: at most 3 sub-queries, each non-empty
-            queries = [q.strip() for q in queries[:3] if q.strip()]
-            if not queries:
-                queries = [core_question]
-            print(f"[DECOMPOSE] sub-queries: {queries}")
-            return queries
-        except Exception as exc:
-            logger.warning("Decompose failed, using raw question: %s", exc)
-            return [core_question]
-
-    # ------------------------------------------------------------------
     # Retrieval helpers
     # ------------------------------------------------------------------
 
@@ -308,7 +149,6 @@ class OfficeQASolver:
         queries: list[str],
         source_hints,
         is_page_question: bool,
-        has_month_queries: bool = False,
     ) -> list[RetrievedContext]:
         """Retrieve for each sub-query and merge via deduplication + score."""
         all_contexts: list[RetrievedContext] = []
@@ -332,7 +172,7 @@ class OfficeQASolver:
                 )
             )
 
-        limit = self._context_limit(source_hints, has_month_queries=has_month_queries)
+        limit = self._context_limit(source_hints)
         return self._dedup_and_rank(all_contexts, limit)
 
     def _collect_single_query_contexts(self, query: str, source_hints) -> list[RetrievedContext]:
@@ -358,10 +198,8 @@ class OfficeQASolver:
         contexts.extend(self._retriever.retrieve(query, query_vec))
         return contexts
 
-    def _context_limit(self, source_hints, has_month_queries: bool = False) -> int:
+    def _context_limit(self, source_hints) -> int:
         base = self._config.retrieval_top_k
-        if has_month_queries:
-            return max(base + 15, 30)  # Need more context for monthly data
         if source_hints.source_files:
             return max(base + 10, 20)
         return base + 5
@@ -445,13 +283,13 @@ class OfficeQASolver:
     # Prompt builders
     # ------------------------------------------------------------------
 
-    def _build_prompt(self, question: str, contexts: list[RetrievedContext], is_page_question: bool = False, table_data: str = "", plan: dict | None = None) -> str:
+    def _build_prompt(self, question: str, contexts: list[RetrievedContext], is_page_question: bool = False, table_data: str = "") -> str:
         lines = [
             "Solve the following OfficeQA question using the best available evidence.",
             "",
             "FINAL_ANSWER rules:",
             "- Output ONLY the bare number or value. No units (no 'million', 'dollars', etc.), no prose, no markdown.",
-            "- If the question says 'in millions of dollars', the answer is just the number (e.g., '507' not '507 million').",
+            "- Pay close attention to the units the question asks for and ensure your answer is in those units.",
             "- Use square brackets only if the question explicitly asks for a bracketed list.",
         ]
         if is_page_question:
@@ -462,15 +300,6 @@ class OfficeQASolver:
                 "- Do NOT report bulletin section codes (like 'B-462-B') or index numbers.",
                 "- Look for the page number at the top or bottom of the page content.",
             ])
-        # Inject plan data_points as row-label guidance
-        if plan and plan.get("data_points"):
-            lines.extend(["", "EXACT DATA TO FIND (match these labels precisely in the tables):"])
-            for dp in plan["data_points"]:
-                lines.append(f"  - {dp}")
-        if plan and plan.get("constraints"):
-            lines.extend(["", "QUESTION CONSTRAINTS:"])
-            for c in plan["constraints"]:
-                lines.append(f"  - {c}")
         lines.extend([
             "",
             "Question:",
@@ -483,13 +312,24 @@ class OfficeQASolver:
                 table_data,
             ])
         if contexts:
+            header_tokens = _count_tokens("\n".join(lines))
+            budget = PROMPT_TOKEN_BUDGET - header_tokens
             lines.extend(["", "Retrieved context:"])
+            kept = 0
             for index, context in enumerate(contexts, start=1):
+                block = f"[Source {index}] {context.source} (score={context.score:.1f})\n{context.content}\n"
+                block_tokens = _count_tokens(block)
+                if block_tokens > budget:
+                    break
                 lines.extend([
                     f"[Source {index}] {context.source} (score={context.score:.1f})",
                     context.content,
                     "",
                 ])
+                budget -= block_tokens
+                kept += 1
+            if kept < len(contexts):
+                print(f"[PROMPT TRIM] kept top {kept}/{len(contexts)} contexts to fit token budget", flush=True)
         else:
             lines.extend([
                 "",
