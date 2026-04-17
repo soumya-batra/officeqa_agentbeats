@@ -10,7 +10,7 @@ from llm import LLMClient
 from models import RetrievedContext, SolverResult
 from faiss_retriever import FaissRetriever
 from source_hints import parse_source_hints
-from table_parser import find_calendar_year_total, reformat_tables_in_context
+from table_parser import reformat_tables_in_context
 
 
 logger = logging.getLogger(__name__)
@@ -46,14 +46,9 @@ You MUST always end your response with both tags below — never omit FINAL_ANSW
 [1-2 sentence summary of how you derived the answer]
 </REASONING>
 <FINAL_ANSWER>
-[bare number or value only — no units, no prose, no markdown]
+[your computed value, including its sign — no explanation]
 </FINAL_ANSWER>
 """
-
-_PAGE_NUMBER_RE = re.compile(
-    r"\b(?:page\s*number|what\s+(?:is\s+)?(?:the\s+)?page|which\s+page)\b", re.I
-)
-
 
 class OfficeQASolver:
     def __init__(self, config: SolverConfig | None = None, llm_client: LLMClient | None = None):
@@ -70,11 +65,10 @@ class OfficeQASolver:
         question_uid = self._extract_question_uid(question)
         source_hints = parse_source_hints(question)
         core_question = self._extract_core_question(question)
-        is_page_q = bool(_PAGE_NUMBER_RE.search(core_question))
 
         # ── Retrieval ────────────────────────────────────────────────
         sub_queries = [core_question]
-        contexts = self._collect_multi_query_contexts(sub_queries, source_hints, is_page_q)
+        contexts = self._collect_multi_query_contexts(sub_queries, source_hints)
 
         self._log_chunks(contexts)
         logger.info(
@@ -98,13 +92,8 @@ class OfficeQASolver:
             # ── Reformat tables for LLM readability ──────────────────
             contexts = self._reformat_contexts(contexts)
 
-            # ── Table extraction ─────────────────────────────────────
-            table_data = self._extract_table_data(core_question, contexts)
-            if table_data:
-                print(f"[TABLE EXTRACT]\n{table_data}")
-
             # ── Solver ───────────────────────────────────────────────
-            prompt = self._build_prompt(core_question, contexts, is_page_q, table_data=table_data)
+            prompt = self._build_prompt(core_question, contexts)
             raw_response = self._llm_client.complete(system_prompt=SYSTEM_PROMPT, prompt=prompt)
             reasoning, final_answer = ensure_structured_response(raw_response)
 
@@ -148,7 +137,6 @@ class OfficeQASolver:
         self,
         queries: list[str],
         source_hints,
-        is_page_question: bool,
     ) -> list[RetrievedContext]:
         """Retrieve for each sub-query and merge via deduplication + score."""
         all_contexts: list[RetrievedContext] = []
@@ -159,18 +147,6 @@ class OfficeQASolver:
                 continue
             seen_queries.add(query)
             all_contexts.extend(self._collect_single_query_contexts(query, source_hints))
-
-        # For page-number questions, also load JSON page contexts if available
-        if is_page_question and source_hints.source_files:
-            all_contexts.extend(
-                load_page_contexts(
-                    self._config.parsed_json_dir,
-                    source_hints.source_files,
-                    source_hints.source_pages,
-                    queries[0],
-                    top_k=10,
-                )
-            )
 
         limit = self._context_limit(source_hints)
         return self._dedup_and_rank(all_contexts, limit)
@@ -255,62 +231,23 @@ class OfficeQASolver:
     # Table extraction (structured data for LLM)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_table_data(question: str, contexts: list[RetrievedContext]) -> str:
-        """Pre-extract structured table data from retrieved contexts.
-
-        Only extracts calendar year totals (precise computation).
-        General row ranking is too noisy and can mislead the LLM.
-        """
-        lines: list[str] = []
-
-        # Try calendar year total extraction (handles monthly sum questions)
-        try:
-            cal_result = find_calendar_year_total(question, contexts)
-            if cal_result is not None:
-                total, explanation = cal_result
-                lines.append(f"HINT — Calendar year total (sum of monthly values): {total:,.2f}")
-                lines.append(f"  ({explanation})")
-                lines.append("  Verify this against the source context before using.")
-                lines.append("")
-        except Exception:
-            pass
-
-        return "\n".join(lines) if lines else ""
-
-
     # ------------------------------------------------------------------
     # Prompt builders
     # ------------------------------------------------------------------
 
-    def _build_prompt(self, question: str, contexts: list[RetrievedContext], is_page_question: bool = False, table_data: str = "") -> str:
+    def _build_prompt(self, question: str, contexts: list[RetrievedContext]) -> str:
         lines = [
             "Solve the following OfficeQA question using the best available evidence.",
             "",
             "FINAL_ANSWER rules:",
-            "- Output ONLY the bare number or value. No units (no 'million', 'dollars', etc.), no prose, no markdown.",
+            "- Output ONLY your computed value, including its sign — no explanation.",
             "- Pay close attention to the units the question asks for and ensure your answer is in those units.",
-            "- Use square brackets only if the question explicitly asks for a bracketed list.",
         ]
-        if is_page_question:
-            lines.extend([
-                "",
-                "PAGE NUMBER GUIDANCE:",
-                "- The answer is the physical page number printed on the page (a small integer, usually 1-100).",
-                "- Do NOT report bulletin section codes (like 'B-462-B') or index numbers.",
-                "- Look for the page number at the top or bottom of the page content.",
-            ])
         lines.extend([
             "",
             "Question:",
             question,
         ])
-        if table_data:
-            lines.extend([
-                "",
-                "STRUCTURED TABLE DATA (pre-extracted from retrieved context — use these values when they match your query):",
-                table_data,
-            ])
         if contexts:
             header_tokens = _count_tokens("\n".join(lines))
             budget = PROMPT_TOKEN_BUDGET - header_tokens

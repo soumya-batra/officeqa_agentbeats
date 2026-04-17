@@ -166,7 +166,7 @@ def _normalize_numeric_token(token: str, *, keep_percent: bool) -> str:
 
 
 def _candidate_lines(text: str) -> list[str]:
-    raw_lines = [line.strip(" -*") for line in text.splitlines()]
+    raw_lines = [re.sub(r"^[\s\-\*]+(?![\d.])", "", line).strip() for line in text.splitlines()]
     return [line for line in raw_lines if line.strip()]
 
 

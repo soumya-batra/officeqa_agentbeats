@@ -291,87 +291,120 @@ class LLMClient:
         ]
 
         MAX_TOOL_ITERS = 5
-        EMPTY_RETRIES = 2
+        MAX_WEB_SEARCHES = 2
+        cur_messages = list(messages)
+        sandbox_ns = {"__name__": "__main__"}
+        web_search_count = 0
 
-        for empty_attempt in range(EMPTY_RETRIES + 1):
-            cur_messages = list(messages)
-            sandbox_ns = {"__name__": "__main__"}
+        for iteration in range(MAX_TOOL_ITERS + 1):
+            kwargs = {
+                "model": model,
+                "messages": cur_messages,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "max_tokens": 12000,
+            }
+            if iteration < MAX_TOOL_ITERS:
+                kwargs["tools"] = tools
+            response = self._nebius_call_with_retry(client, kwargs)
 
-            for iteration in range(MAX_TOOL_ITERS + 1):
-                kwargs = {
-                    "model": model,
-                    "messages": cur_messages,
-                    "temperature": 1.0,
-                    "top_p": 0.95,
-                    "max_tokens": 12000,
-                }
-                if iteration < MAX_TOOL_ITERS:
-                    kwargs["tools"] = tools
-                response = self._nebius_call_with_retry(client, kwargs)
+            choice = response.choices[0]
+            msg = choice.message
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            print(
+                f"[KIMI DEBUG iter={iteration}] finish_reason={choice.finish_reason} "
+                f"content_len={len(msg.content or '')} content_repr={repr((msg.content or '')[:200])} "
+                f"tool_calls={len(tool_calls)} "
+                f"role={getattr(msg, 'role', '?')}",
+                flush=True,
+            )
 
-                msg = response.choices[0].message
-                tool_calls = getattr(msg, "tool_calls", None) or []
+            if tool_calls:
+                parsed_calls = [
+                    (tc.id, tc.function.name, tc.function.arguments or "")
+                    for tc in tool_calls
+                ]
+                clean_content = msg.content or ""
+            elif msg.content and "<|tool_call_begin|>" in msg.content:
+                parsed_calls, clean_content = self._parse_kimi_native_tool_calls(msg.content)
+                if parsed_calls:
+                    print(
+                        f"[KIMI native-markup tool calls parsed: {len(parsed_calls)} iter={iteration}]",
+                        flush=True,
+                    )
+            else:
+                parsed_calls, clean_content = [], msg.content or ""
 
-                if tool_calls:
-                    parsed_calls = [
-                        (tc.id, tc.function.name, tc.function.arguments or "")
-                        for tc in tool_calls
-                    ]
-                    clean_content = msg.content or ""
-                elif msg.content and "<|tool_call_begin|>" in msg.content:
-                    parsed_calls, clean_content = self._parse_kimi_native_tool_calls(msg.content)
-                    if parsed_calls:
-                        print(
-                            f"[KIMI native-markup tool calls parsed: {len(parsed_calls)} iter={iteration}]",
-                            flush=True,
-                        )
+            if not parsed_calls:
+                if not clean_content and iteration > 0:
+                    print(
+                        f"[KIMI empty after tool calls iter={iteration}] sending nudge",
+                        flush=True,
+                    )
+                    cur_messages.append({"role": "assistant", "content": ""})
+                    cur_messages.append({
+                        "role": "user",
+                        "content": "You used tools above but produced no text. "
+                        "Please provide your REASONING and FINAL_ANSWER now.",
+                    })
+                    nudge_resp = self._nebius_call_with_retry(client, {
+                        "model": model,
+                        "messages": cur_messages,
+                        "temperature": 1.0,
+                        "top_p": 0.95,
+                        "max_tokens": 12000,
+                    })
+                    nudge_content = nudge_resp.choices[0].message.content or ""
+                    print(
+                        f"[KIMI nudge response] len={len(nudge_content)} "
+                        f"repr={repr(nudge_content[:200])}",
+                        flush=True,
+                    )
+                    return nudge_content
+                return clean_content
+
+            cur_messages.append({
+                "role": "assistant",
+                "content": clean_content,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": args_json},
+                    }
+                    for call_id, name, args_json in parsed_calls
+                ],
+            })
+
+            for call_id, name, args_json in parsed_calls:
+                try:
+                    args = json.loads(args_json or "{}")
+                except Exception as parse_err:
+                    result = f"Error parsing tool arguments: {parse_err}"
                 else:
-                    parsed_calls, clean_content = [], msg.content or ""
-
-                if not parsed_calls:
-                    if clean_content.strip():
-                        return clean_content
-                    if empty_attempt < EMPTY_RETRIES:
-                        print(f"[KIMI empty response, retry {empty_attempt+1}/{EMPTY_RETRIES}]", flush=True)
-                    break
-
-                cur_messages.append({
-                    "role": "assistant",
-                    "content": clean_content,
-                    "tool_calls": [
-                        {
-                            "id": call_id,
-                            "type": "function",
-                            "function": {"name": name, "arguments": args_json},
-                        }
-                        for call_id, name, args_json in parsed_calls
-                    ],
-                })
-
-                for call_id, name, args_json in parsed_calls:
-                    try:
-                        args = json.loads(args_json or "{}")
-                    except Exception as parse_err:
-                        result = f"Error parsing tool arguments: {parse_err}"
-                    else:
-                        if name == "web_search":
-                            query = args.get("query", "")
-                            print(f"\n[KIMI web_search iter={iteration}] {query}", flush=True)
+                    if name == "web_search":
+                        query = args.get("query", "")
+                        if web_search_count >= MAX_WEB_SEARCHES:
+                            print(f"\n[KIMI web_search CAPPED iter={iteration}] {query}", flush=True)
+                            result = "Search limit reached. Use the retrieved context and any prior search results to answer."
+                        else:
+                            web_search_count += 1
+                            print(f"\n[KIMI web_search iter={iteration} ({web_search_count}/{MAX_WEB_SEARCHES})] {query}", flush=True)
                             result = _tavily_search(query)
                             print(f"[KIMI search result]\n{result[:400]}", flush=True)
-                        else:
-                            code = args.get("code", "")
-                            print(f"\n[KIMI execute_python iter={iteration}]\n{code[:800]}", flush=True)
-                            result = _sandboxed_python(code, namespace=sandbox_ns)
-                            print(f"[KIMI tool result]\n{result[:400]}", flush=True)
-                    cur_messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "name": name,
-                        "content": result,
-                    })
-            else:
-                return msg.content or ""
+                    else:
+                        code = args.get("code", "")
+                        print(f"\n[KIMI execute_python iter={iteration}]\n{code[:800]}", flush=True)
+                        result = _sandboxed_python(code, namespace=sandbox_ns)
+                        print(f"[KIMI tool result]\n{result[:400]}", flush=True)
+                cur_messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": result,
+                })
+        else:
+            return msg.content or ""
 
         return ""
 
@@ -381,7 +414,15 @@ class LLMClient:
         for m in _KIMI_TOOL_CALL_RE.finditer(content):
             call_id = m.group(1).strip()
             args_json = m.group(2).strip()
-            calls.append((call_id, "execute_python", args_json))
+            try:
+                args = json.loads(args_json or "{}")
+            except Exception:
+                args = {}
+            if "query" in args and "code" not in args:
+                name = "web_search"
+            else:
+                name = "execute_python"
+            calls.append((call_id, name, args_json))
         clean = _KIMI_SECTION_WRAPPER_RE.sub("", content)
         clean = _KIMI_ORPHAN_MARKER_RE.sub("", clean).strip()
         return calls, clean
