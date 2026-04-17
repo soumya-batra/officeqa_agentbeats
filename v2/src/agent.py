@@ -59,7 +59,8 @@ FORMATTING RULES:
 - Emit exactly one value (or one list). Multiple candidate numbers will AUTO-FAIL.
 - No units suffix (no "million", "dollars") unless the answer is a text string. Use bare number.
 - Never output "no answer found" — give your best numeric guess.
-- Write Python code (using print()) for ALL arithmetic. Show final value clearly.
+- Use code_interpreter for ALL arithmetic. Show final value clearly with print().
+- If a web_search tool is available, use it to look up facts not in the retrieved context (e.g. historical dates, bureau names, exchange rates, CPI values).
 
 You MUST always end with both tags:
 <REASONING>
@@ -71,13 +72,18 @@ You MUST always end with both tags:
 
 REFINE_SYSTEM = """You previously drafted an answer but it may be incomplete or wrong.
 Re-read the new excerpts and submit a corrected final answer using the same format.
-Pay special attention to: correct sign (negative/positive), correct units, exact digits."""
+Pay special attention to: correct sign (negative/positive), correct units, exact digits, rounding."""
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
 _REASONING_RE = re.compile(r"<REASONING>\s*(.*?)\s*</REASONING>", re.DOTALL | re.IGNORECASE)
 _FINAL_RE = re.compile(r"<FINAL_ANSWER>\s*(.*?)\s*</FINAL_ANSWER>", re.DOTALL | re.IGNORECASE)
 _NUM_RE = re.compile(r"-?\d+(?:[,\d]*\d)?(?:\.\d+)?%?")
+_ANSWER_PHRASE_RE = re.compile(
+    r"(?:(?:the\s+)?(?:final\s+)?answer\s+is|total\s+(?:is|=|:)|therefore|thus)[:\s]*"
+    r"(-?\$?[\d,]+\.?\d*%?)",
+    re.IGNORECASE,
+)
 
 
 def _years_in(text: str) -> list[int]:
@@ -106,6 +112,27 @@ def _extract_reasoning(text: str) -> str | None:
 def _extract_final_answer(text: str) -> str | None:
     m = _FINAL_RE.search(text or "")
     return m.group(1).strip() if m else None
+
+
+def _fallback_extract_answer(text: str) -> str:
+    """Try to pull a numeric answer from free text when FINAL_ANSWER tag is missing."""
+    m = _ANSWER_PHRASE_RE.search(text)
+    if m:
+        return m.group(1).replace("$", "")
+    numbers = [n.replace("$", "") for n in _NUM_RE.findall(text) if not _is_year_token(n)]
+    if numbers:
+        return numbers[-1]
+    return ""
+
+
+def _is_year_token(token: str) -> bool:
+    bare = token.replace(",", "").rstrip("%").replace(".", "").lstrip("-")
+    if not bare.isdigit():
+        return False
+    try:
+        return 1900 <= int(bare) <= 2100
+    except ValueError:
+        return False
 
 
 def _missing_info(text: str) -> bool:
@@ -137,13 +164,17 @@ def _normalize_response(text: str) -> str:
     r = reasoning.group(1).strip() if reasoning else "(not provided)"
     f = final.group(1).strip() if final else ""
 
-    if not reasoning and not final:
-        nums = _NUM_RE.findall(text)
-        f = nums[-1] if nums else text.strip()[:200]
-        r = text.strip()[:2000]
-
+    # Fallback: if no FINAL_ANSWER tag, try to extract from reasoning or raw text
     if not f:
-        f = "0"
+        if reasoning:
+            f = _fallback_extract_answer(reasoning.group(1))
+        if not f:
+            f = _fallback_extract_answer(text)
+        if not f:
+            f = "0"
+
+    if not reasoning and not final:
+        r = text.strip()[:2000]
 
     # De-hedge: if multiple numbers (not a list), keep first non-year
     is_list = bool(re.search(r"\[.*?,.*?\]", f))
@@ -174,23 +205,6 @@ def _is_year(s: str) -> bool:
         return False
 
 
-def _sandboxed_python(code: str) -> str:
-    """Execute Python code locally and return stdout."""
-    import io
-    import contextlib
-    namespace = {"__name__": "__main__"}
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            exec(code, namespace)
-        out = buf.getvalue() or "(no stdout)"
-    except Exception as e:
-        out = f"Error: {type(e).__name__}: {e}"
-    if len(out) > 4000:
-        out = out[:4000] + "\n...[truncated]"
-    return out
-
-
 @dataclass
 class AgentResult:
     reasoning: str
@@ -208,6 +222,8 @@ class OfficeQAAgent:
         t0 = time.time()
         try:
             tools = [{"type": "code_interpreter", "container": {"type": "auto"}}]
+            if os.environ.get("ENABLE_WEB_SEARCH", "").lower() in ("1", "true", "yes"):
+                tools.append({"type": "web_search"})
             resp = self.client.responses.create(
                 model=MODEL,
                 instructions=system,
