@@ -1,4 +1,9 @@
-"""Corpus loader: downloads Treasury Bulletins from GitHub, chunks, and builds BM25 index."""
+"""Corpus loader: downloads Treasury Bulletins from GitHub, chunks, and builds BM25 index.
+
+Parts of this file (tokenizer, stopwords, Chunk, corpus URL) are adapted from
+ab-shetty/mids-officeqa-alpha:
+https://github.com/ab-shetty/mids-officeqa-alpha/blob/main/src/corpus.py
+"""
 from __future__ import annotations
 
 import logging
